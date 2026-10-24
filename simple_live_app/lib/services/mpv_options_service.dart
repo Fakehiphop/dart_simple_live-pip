@@ -92,7 +92,20 @@ class MpvOptionsService {
     return MpvEffectiveOptions(options, source);
   }
 
-  static VideoControllerConfiguration videoControllerConfiguration() {
+  /// [forIosPip] 为 true 时，iOS 上改用软件渲染输出（`TextureSW`）。
+  ///
+  /// 画中画要从这块纹理取帧喂给 `AVSampleBufferDisplayLayer`，因此退到后台后
+  /// 它必须仍可读。`enableHardwareAcceleration: true` 会选中 media_kit_video 的
+  /// `TextureHW`，它渲染进 OpenGL ES FBO；iOS 对后台应用限制 GPU 提交，FBO 里
+  /// 便是不完整或陈旧的内容，小窗画面会在相邻两帧之间抖动。`false` 选中
+  /// `TextureSW`，mpv 用 `MPV_RENDER_API_TYPE_SW` 直接写进 CVPixelBuffer 的
+  /// base address，全程 CPU。
+  ///
+  /// 软件渲染比 GPU 输出更耗 CPU 和电量，所以只在确实要提供画中画的播放器上
+  /// 启用；多房间、普通小窗等场景仍走 GPU。
+  static VideoControllerConfiguration videoControllerConfiguration({
+    bool forIosPip = false,
+  }) {
     final settings = AppSettingsController.instance;
     if (settings.playerCompatMode.value && Platform.isAndroid) {
       return const VideoControllerConfiguration(
@@ -102,6 +115,14 @@ class MpvOptionsService {
     }
     final effectiveOptions = effectiveOptionsWithSource();
     final options = effectiveOptions.options;
+    if (Platform.isIOS) {
+      // `hwdec` is a separate layer (it only decides who decodes the stream), so
+      // hardware decoding is left as the user configured it either way.
+      return VideoControllerConfiguration(
+        hwdec: _desktopVideoControllerHwdec(effectiveOptions),
+        enableHardwareAcceleration: !forIosPip,
+      );
+    }
     if (!Platform.isAndroid) {
       return VideoControllerConfiguration(
         hwdec: _desktopVideoControllerHwdec(effectiveOptions),

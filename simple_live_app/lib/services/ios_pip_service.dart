@@ -117,7 +117,11 @@ abstract final class IosPipService {
   }
 
   /// 把 media_kit 的播放状态打包成原生侧需要的字段（毫秒）。
-  static Map<String, Object> stateOf(Player player) {
+  ///
+  /// [isLive] 必须由调用方显式给出。直播流经 mpv 解析后 `duration` 未必是 0
+  /// （部分 flv/hls 会给一个有限值），靠时长反推会把直播当成点播，小窗就会
+  /// 出现进度条和快进/快退按钮。
+  static Map<String, Object> stateOf(Player player, {bool? isLive}) {
     final state = player.state;
     return {
       'isPlaying': state.playing,
@@ -125,8 +129,7 @@ abstract final class IosPipService {
       'position': state.position.inMilliseconds,
       'duration': state.duration.inMilliseconds,
       'speed': state.rate,
-      // 直播没有有意义的时长，小窗按直播样式显示。
-      'isLive': !(state.duration.inMilliseconds > 0),
+      'isLive': isLive ?? !(state.duration.inMilliseconds > 0),
     };
   }
 }

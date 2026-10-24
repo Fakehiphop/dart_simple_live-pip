@@ -201,9 +201,14 @@ mixin PlayerMixin {
   }
 
   /// 视频控制器
+  ///
+  /// iOS 上这个播放器要提供画中画，因此走软件渲染输出，见
+  /// [MpvOptionsService.videoControllerConfiguration] 的 `forIosPip`。
   late final videoController = VideoController(
     player,
-    configuration: MpvOptionsService.videoControllerConfiguration(),
+    configuration: MpvOptionsService.videoControllerConfiguration(
+      forIosPip: Platform.isIOS,
+    ),
   );
 }
 
@@ -1478,8 +1483,12 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
 
   // ---- iOS 画中画 ----
 
-  /// 原生侧需要的播放状态。直播没有时长，`isLive` 为 true。
-  Map<String, Object> _iosPipStateMap() => IosPipService.stateOf(player);
+  /// 原生侧需要的播放状态。直播没有时长，`isLive` 显式传 true。
+  ///
+  /// 不能靠 `duration` 反推：部分直播流（flv/hls）经 mpv 解析后会给一个有限
+  /// 时长，反推会失败，小窗就按点播渲染出进度条和快进/快退按钮。
+  Map<String, Object> _iosPipStateMap() =>
+      IosPipService.stateOf(player, isLive: true);
 
   /// iOS 小窗进入时隐藏弹幕/控制器（与 Android 小窗表现一致）。
   void _applyIosPipEnteredState() {
@@ -1521,12 +1530,8 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
       }
     };
     IosPipService.onSkip = (delta) {
-      final target = player.state.position + delta;
-      final duration = player.state.duration;
-      final clamped = target < Duration.zero
-          ? Duration.zero
-          : (duration > Duration.zero && target > duration ? duration : target);
-      unawaited(player.seek(clamped));
+      // 直播不可跳转：小窗不该给出可用快进/快退，这里直接忽略。
+      Log.d("直播画中画忽略跳转请求: $delta");
     };
     // 只在前台弹提示（后台失败静默），并清掉武装标记：原生侧没有画面了，
     // 不能继续按"小窗已武装"在后台解码。
