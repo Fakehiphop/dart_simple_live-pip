@@ -11,6 +11,8 @@ class ScrollDanmakuPainter extends CustomPainter {
   final int fontWeight;
   final String? fontFamily;
   final bool showStroke;
+  final double strokeWidth;
+  final double opacity;
   final double danmakuHeight;
   final bool running;
   final int tick;
@@ -30,6 +32,8 @@ class ScrollDanmakuPainter extends CustomPainter {
     this.fontWeight,
     this.fontFamily,
     this.showStroke,
+    this.strokeWidth,
+    this.opacity,
     this.danmakuHeight,
     this.running,
     this.tick,
@@ -59,6 +63,7 @@ class ScrollDanmakuPainter extends CustomPainter {
         fontWeight,
         1.25,
         fontFamily,
+        opacity,
       );
 
       if (showStroke) {
@@ -69,6 +74,8 @@ class ScrollDanmakuPainter extends CustomPainter {
           fontWeight,
           1.25,
           fontFamily,
+          opacity,
+          strokeWidth,
         );
         if (item.strokeParagraph != null) {
           canvas.drawParagraph(
@@ -94,6 +101,7 @@ class ScrollDanmakuPainter extends CustomPainter {
         item.content,
         offset,
         emojiImageCache,
+        opacity,
       );
       item.lastDrawTick = tick;
     }

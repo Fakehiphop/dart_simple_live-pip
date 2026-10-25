@@ -1,5 +1,5 @@
 name: simple_live_app
-version: 1.13.2+11302
+version: 1.13.3+11303
 publish_to: none
 description: "Simple Live APP"
 environment:
@@ -9,7 +9,8 @@ dependencies:
   simple_live_core:
     path: ../simple_live_core
   dart_quickjs:
-    path: ../third_party/dart_quickjs
+    git:
+      url: https://github.com/xiaoyaocz/dart_quickjs
   # 图标
   cupertino_icons: ^1.0.8
   remixicon: ^1.4.1 #Remix图标
@@ -97,6 +98,9 @@ dependency_overrides:
     path: ../third_party/canvas_danmaku
   media_kit_libs_windows_video:
     path: ../third_party/media_kit_libs_windows_video
+  # Synchronous VideoOutput disposal on Windows to fix fast-fail on exit.
+  media_kit_video:
+    path: ../third_party/media_kit_video
 
 flutter_launcher_icons:
   android: true

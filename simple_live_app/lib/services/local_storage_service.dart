@@ -46,6 +46,8 @@ class LocalStorageService extends GetxService {
   static const String kDanmuDelay = "DanmuDelay";
   static const String kDanmuOpacity = "DanmuOpacity";
   static const String kDanmuStrokeWidth = "DanmuStrokeWidth";
+  static const String kDanmuStrokeEnable = "DanmuStrokeEnable";
+  static const String kDanmuMaxFps = "DanmuMaxFps";
   static const String kDanmuHideScroll = "DanmuHideScroll";
   static const String kDanmuHideBottom = "DanmuHideBottom";
   static const String kDanmuHideTop = "DanmuHideTop";
@@ -71,6 +73,7 @@ class LocalStorageService extends GetxService {
   static const String kAutoExitDuration = "AutoExitDuration";
   static const String kRoomAutoExitDuration = "RoomAutoExitDuration";
   static const String kPlayerCompatMode = "PlayerCompatMode";
+  static const String kPowerSaveMode = "PowerSaveMode";
   static const String kPlayerAutoPause = "PlayerAutoPause";
   static const String kAllowBackgroundPlayback = "AllowBackgroundPlayback";
   static const String kPlayerFullscreenOrientation =

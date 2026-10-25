@@ -157,7 +157,6 @@ import AVFoundation
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
-    // 画中画插件在 Runner target 内，不会被 GeneratedPluginRegistrant 注册。
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "PipPlugin") {
       PipPlugin.register(with: registrar)
     }

@@ -13,6 +13,7 @@ class SpecialDanmakuPainter extends CustomPainter {
   final String? fontFamily;
   final bool running;
   final int tick;
+  final double opacity;
   final int batchThreshold;
 
   SpecialDanmakuPainter(
@@ -22,7 +23,8 @@ class SpecialDanmakuPainter extends CustomPainter {
     this.fontWeight,
     this.fontFamily,
     this.running,
-    this.tick, {
+    this.tick,
+    this.opacity, {
     this.batchThreshold = 10, // 默认值为10，可以自行调整
   });
 
@@ -53,11 +55,12 @@ class SpecialDanmakuPainter extends CustomPainter {
     Size size,
     int elapsed,
   ) {
-    // 透明度动画
+    // 透明度动画（弹幕层透明度并入文本 alpha，避免整层 saveLayer）
     late final alpha =
-        item.alphaTween?.transform(elapsed / item.duration) ??
-        item.color.opacity;
-    final color = item.alphaTween == null
+        (item.alphaTween?.transform(elapsed / item.duration) ??
+            item.color.opacity) *
+        opacity;
+    final color = item.alphaTween == null && opacity >= 1.0
         ? item.color
         : item.color.withOpacity(alpha);
     // 文本

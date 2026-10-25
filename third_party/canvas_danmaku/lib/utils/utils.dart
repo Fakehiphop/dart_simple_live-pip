@@ -54,6 +54,7 @@ class Utils {
     int fontWeight, [
     double emojiScale = 1.25,
     String? fontFamily,
+    double opacity = 1.0,
   ]) {
     final builder = ui.ParagraphBuilder(
       ui.ParagraphStyle(
@@ -63,7 +64,10 @@ class Utils {
         fontFamily: fontFamily,
         textDirection: TextDirection.ltr,
       ),
-    )..pushStyle(ui.TextStyle(color: content.color, fontFamily: fontFamily));
+    )..pushStyle(ui.TextStyle(
+        color: content.color.withOpacity(content.color.opacity * opacity),
+        fontFamily: fontFamily,
+      ));
     _appendContent(builder, content, fontSize, emojiScale);
     return builder.build()
       ..layout(ui.ParagraphConstraints(width: danmakuWidth));
@@ -76,11 +80,13 @@ class Utils {
     int fontWeight, [
     double emojiScale = 1.25,
     String? fontFamily,
+    double opacity = 1.0,
+    double strokeWidth = 2.0,
   ]) {
     final Paint strokePaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2
-      ..color = Colors.black;
+      ..strokeWidth = strokeWidth
+      ..color = Colors.black.withOpacity(opacity);
 
     final ui.ParagraphBuilder strokeBuilder = ui.ParagraphBuilder(
       ui.ParagraphStyle(
@@ -102,14 +108,17 @@ class Utils {
     ui.Paragraph paragraph,
     DanmakuContentItem content,
     Offset offset,
-    Map<String, ui.Image> imageCache,
-  ) {
+    Map<String, ui.Image> imageCache, [
+    double opacity = 1.0,
+  ]) {
     final imageUrls = imageUrlsForContent(content);
     if (imageUrls.isEmpty) {
       return;
     }
     final boxes = paragraph.getBoxesForPlaceholders();
-    final paint = Paint()..filterQuality = FilterQuality.medium;
+    final paint = Paint()
+      ..filterQuality = FilterQuality.medium
+      ..color = Color.fromRGBO(255, 255, 255, opacity);
     for (var i = 0; i < imageUrls.length && i < boxes.length; i++) {
       final image = imageCache[imageUrls[i]];
       if (image == null) {

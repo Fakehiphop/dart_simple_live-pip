@@ -18,7 +18,8 @@ dependencies:
     path: ./packages/tars_dart
   fixnum: ^1.1.0
   dart_quickjs:
-    path: ../third_party/dart_quickjs
+    git:
+      url: https://github.com/xiaoyaocz/dart_quickjs
   cookie_jar: ^4.0.8
   dio_cookie_manager: ^3.3.0
 

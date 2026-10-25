@@ -32,7 +32,6 @@ import 'package:simple_live_app/routes/route_path.dart';
 import 'package:simple_live_app/services/current_room_service.dart';
 import 'package:simple_live_app/services/db_service.dart';
 import 'package:simple_live_app/services/ios_audio_session_service.dart';
-import 'package:simple_live_app/services/ios_pip_service.dart';
 import 'package:simple_live_app/services/follow_service.dart';
 import 'package:simple_live_app/services/live_subtitle_service.dart';
 import 'package:simple_live_app/services/mpv_options_service.dart';
@@ -225,6 +224,7 @@ class LiveRoomController extends PlayerController
   int? _lastVideoOutputDropCount;
   int _videoOutputDropSamples = 0;
   bool _outputDropSamplePending = false;
+  DateTime? _lastVideoOutputDropSampleAt;
   bool _watchdogRefreshing = false;
   DateTime? _lastWatchdogRefreshAt;
 
@@ -320,6 +320,32 @@ class LiveRoomController extends PlayerController
     return scrollController.position.extentAfter <= 24;
   }
 
+  /// 屏蔽词 Pattern 编译缓存：正则编译远比匹配昂贵，高热房间每秒
+  /// 几十条消息 × N 个屏蔽词，不能每条消息都重新编译
+  static final Map<String, Pattern> _shieldPatternCache = {};
+  static final Set<String> _invalidShieldPatterns = {};
+
+  Pattern? _shieldPatternFor(String keyword) {
+    if (!Utils.isRegexFormat(keyword)) {
+      return keyword;
+    }
+    if (_shieldPatternCache.containsKey(keyword)) {
+      return _shieldPatternCache[keyword];
+    }
+    if (_invalidShieldPatterns.contains(keyword)) {
+      return null;
+    }
+    try {
+      final pattern = RegExp(Utils.removeRegexFormat(keyword));
+      _shieldPatternCache[keyword] = pattern;
+      return pattern;
+    } catch (e) {
+      Log.d("正则屏蔽词 $keyword 无法编译，已跳过");
+      _invalidShieldPatterns.add(keyword);
+      return null;
+    }
+  }
+
   bool _isKeywordShielded(LiveMessage msg) {
     final settings = AppSettingsController.instance;
     if (!settings.danmuShieldEnable.value ||
@@ -327,17 +353,7 @@ class LiveRoomController extends PlayerController
       return false;
     }
     for (var keyword in settings.shieldList) {
-      Pattern? pattern;
-      if (Utils.isRegexFormat(keyword)) {
-        String removedSlash = Utils.removeRegexFormat(keyword);
-        try {
-          pattern = RegExp(removedSlash);
-        } catch (e) {
-          Log.d("正则屏蔽词 $keyword 无法编译，已跳过");
-        }
-      } else {
-        pattern = keyword;
-      }
+      final pattern = _shieldPatternFor(keyword);
       if (pattern != null && msg.message.contains(pattern)) {
         Log.d("命中屏蔽词 $keyword\n已过滤消息: ${msg.message}");
         return true;
@@ -436,8 +452,10 @@ class LiveRoomController extends PlayerController
     return "$userName\u0001${parts.join("\u0002")}";
   }
 
+  static final RegExp _whitespaceRegExp = RegExp(r"\s+");
+
   String _normalizeDanmuFingerprintPart(String value) {
-    return value.trim().replaceAll(RegExp(r"\s+"), " ");
+    return value.trim().replaceAll(_whitespaceRegExp, " ");
   }
 
   void _clearDanmuDedupeState() {
@@ -1516,7 +1534,7 @@ class LiveRoomController extends PlayerController
     if (_autoPipAttempting) {
       return false;
     }
-    if ((!Platform.isAndroid && !Platform.isIOS) ||
+    if (!(Platform.isAndroid || Platform.isIOS) ||
         !AppSettingsController.instance.autoPipOnExit.value ||
         !liveStatus.value) {
       if (Platform.isAndroid || Platform.isIOS) {
@@ -2798,6 +2816,15 @@ class LiveRoomController extends PlayerController
               children: [
                 Obx(
                   () => SettingsSwitch(
+                    title: "省电模式",
+                    subtitle: "降低发热：简化视频缩放、弹幕限 60 帧、关描边；进入下一个直播间后生效",
+                    value: settings.powerSaveMode.value,
+                    onChanged: settings.setPowerSaveMode,
+                  ),
+                ),
+                AppStyle.divider,
+                Obx(
+                  () => SettingsSwitch(
                     title: "硬件解码",
                     subtitle: "播放失败可尝试关闭此选项",
                     value: settings.hardwareDecode.value,
@@ -3883,13 +3910,11 @@ ${errorStackTrace ?? ""}''');
       }
       unawaited(syncBackgroundPlayback());
       _pausePlaybackForWindowsMinimize();
-      _pausePlaybackForIosBackground();
     } else if (state == AppLifecycleState.resumed) {
       Log.d("返回前台");
       _refreshAutoExitCountdown();
       isBackground = false;
       _resumePlaybackForWindowsMinimize();
-      _resumePlaybackForIosBackground();
       unawaited(
         AppSettingsController.instance.setLastLiveRoomResumePending(false),
       );
@@ -3929,50 +3954,6 @@ ${errorStackTrace ?? ""}''');
       player.pause().catchError((Object e) {
         Log.d("最小化暂停播放失败: $e");
         _pausedForWindowsMinimize = false;
-      }),
-    );
-  }
-
-  /// iOS 退后台时由控制器接管是否暂停。
-  ///
-  /// `Video` 组件在 iOS 上不再自动暂停（见 live_room_page.dart），因为小窗已
-  /// 武装时必须继续解码喂帧。这里补齐原来的暂停语义：未开后台播放、且小窗既
-  /// 未武装也未显示时暂停，回前台再恢复。
-  bool _pausedForIosBackground = false;
-
-  void _pausePlaybackForIosBackground() {
-    if (!Platform.isIOS ||
-        _allowBackgroundPlayback ||
-        listenMode.value ||
-        iosPipArmed ||
-        IosPipService.isActive) {
-      return;
-    }
-    // 武装成功时 `iosPipArmed` 已为 true，走到这里说明小窗既没显示也没武装
-    // （例如画面还没就绪），按原语义暂停，回前台再恢复。
-    if (!player.state.playing || isPlayerClosing) {
-      return;
-    }
-    _pausedForIosBackground = true;
-    unawaited(
-      player.pause().catchError((Object e) {
-        Log.d("iOS 退后台暂停播放失败: $e");
-        _pausedForIosBackground = false;
-      }),
-    );
-  }
-
-  void _resumePlaybackForIosBackground() {
-    if (!_pausedForIosBackground) {
-      return;
-    }
-    _pausedForIosBackground = false;
-    if (isPlayerClosing || !liveStatus.value) {
-      return;
-    }
-    unawaited(
-      player.play().catchError((Object e) {
-        Log.d("iOS 回前台恢复播放失败: $e");
       }),
     );
   }
@@ -4041,12 +4022,15 @@ ${errorStackTrace ?? ""}''');
     _bufferingSampleCount = 0;
     _videoOutputDropSamples = 0;
     _lastVideoOutputDropCount = null;
-    _playbackWatchdog = Timer.periodic(const Duration(seconds: 2), (_) {
+    _lastVideoOutputDropSampleAt = null;
+    // 省电模式放宽采样频率，减少周期唤醒与 native IPC
+    final powerSave = AppSettingsController.instance.powerSaveMode.value;
+    final watchdogInterval =
+        powerSave ? const Duration(seconds: 4) : const Duration(seconds: 2);
+    _playbackWatchdog = Timer.periodic(watchdogInterval, (_) {
       if (!liveStatus.value ||
           player.state.completed ||
-          (isBackground &&
-              ((!_allowBackgroundPlayback && !iosPipArmed) ||
-                  _iosInterrupted))) {
+          (isBackground && (!_allowBackgroundPlayback || _iosInterrupted))) {
         _lastWatchdogPosition = null;
         _stallSampleCount = 0;
         _bufferingSampleCount = 0;
@@ -4065,8 +4049,17 @@ ${errorStackTrace ?? ""}''');
         return;
       }
       if (Platform.isAndroid && !_outputDropSamplePending) {
-        _outputDropSamplePending = true;
-        unawaited(_sampleAndroidVideoOutputDrops());
+        // frame-drop-count 走 native IPC，省电模式下 8 秒采样一次
+        final dropSampleInterval = powerSave
+            ? const Duration(seconds: 8)
+            : const Duration(seconds: 2);
+        final lastDropSample = _lastVideoOutputDropSampleAt;
+        if (lastDropSample == null ||
+            DateTime.now().difference(lastDropSample) >= dropSampleInterval) {
+          _lastVideoOutputDropSampleAt = DateTime.now();
+          _outputDropSamplePending = true;
+          unawaited(_sampleAndroidVideoOutputDrops());
+        }
       }
       final position = player.state.position;
       final last = _lastWatchdogPosition;

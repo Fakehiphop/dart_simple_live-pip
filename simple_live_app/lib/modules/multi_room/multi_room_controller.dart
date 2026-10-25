@@ -1,9 +1,13 @@
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
+import 'package:simple_live_app/app/controller/app_settings_controller.dart';
 import 'package:simple_live_app/modules/multi_room/multi_room_models.dart';
 import 'package:simple_live_app/modules/multi_room/multi_room_player_controller.dart';
 
 class MultiRoomController extends GetxController {
+  /// 省电模式下同时多开的上限：N 路直播流解码+渲染负载线性叠加
+  static const int kPowerSaveMaxRooms = 4;
+
   final List<MultiRoomItem> initialRooms;
 
   MultiRoomController(this.initialRooms);
@@ -13,7 +17,13 @@ class MultiRoomController extends GetxController {
   @override
   void onInit() {
     super.onInit();
-    rooms.assignAll(_distinct(initialRooms));
+    var items = _distinct(initialRooms);
+    if (items.length > kPowerSaveMaxRooms &&
+        AppSettingsController.instance.powerSaveMode.value) {
+      items = items.take(kPowerSaveMaxRooms).toList();
+      SmartDialog.showToast("省电模式下最多同时多开 $kPowerSaveMaxRooms 个直播间");
+    }
+    rooms.assignAll(items);
   }
 
   List<MultiRoomItem> _distinct(Iterable<MultiRoomItem> items) {

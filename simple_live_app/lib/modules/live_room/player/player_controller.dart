@@ -19,7 +19,9 @@ import 'package:simple_live_app/app/controller/app_settings_controller.dart';
 import 'package:simple_live_app/app/controller/base_controller.dart';
 import 'package:simple_live_app/app/custom_throttle.dart';
 import 'package:simple_live_app/app/log.dart';
+import 'package:simple_live_app/app/mpv_exit_helper.dart';
 import 'package:simple_live_app/app/utils.dart';
+import 'package:simple_live_app/routes/route_path.dart';
 import 'package:simple_live_app/services/background_playback_service.dart';
 import 'package:simple_live_app/services/ios_pip_service.dart';
 import 'package:simple_live_app/services/ios_video_output_size.dart';
@@ -591,6 +593,9 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
 
   final pip = Floating();
   StreamSubscription<PiPStatus>? _pipSubscription;
+
+  /// iOS 画中画事件订阅。
+  StreamSubscription<IosPipEvent>? _iosPipSub;
   bool _androidWindowChannelActive = false;
   int? _androidWindowHandlerToken;
   bool _mobileSystemUiApplied = false;
@@ -656,13 +661,6 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     _androidLandscapePendingAfterExternalWindow = false;
     _androidExternalWindowExitGeneration += 1;
     _pipSubscription?.cancel();
-    if (Platform.isIOS) {
-      await cancelIosAutoPipOnLeave();
-      if (_iosPipActive) {
-        _iosPipActive = false;
-        IosPipService.dispose();
-      }
-    }
     if (Platform.isAndroid && _androidWindowChannelActive) {
       final token = _androidWindowHandlerToken;
       _androidWindowChannelActive = false;
@@ -1228,18 +1226,6 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
   int? _autoPipConfiguredVideoWidth;
   int? _autoPipConfiguredVideoHeight;
 
-  // ---- iOS 画中画（原生实现见 ios/Runner/PipPlugin.swift） ----
-  /// iOS 小窗是否正在显示
-  bool _iosPipActive = false;
-  /// iOS 已配置"退后台自动小窗"
-  bool _iosAutoPipConfigured = false;
-  Timer? _iosPipStateSyncTimer;
-
-  /// iOS 小窗已武装或正在显示。
-  ///
-  /// 为 true 时退到后台不能暂停解码，否则小窗画面会冻住。
-  bool get iosPipArmed => _iosPipActive || _iosAutoPipConfigured;
-
   Rational _resolvePipAspectRatio() {
     final width = player.state.width ?? 0;
     final height = player.state.height ?? 0;
@@ -1481,171 +1467,15 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     setDanmakuVisible(danmakuStateBeforePIP);
   }
 
-  // ---- iOS 画中画 ----
-
-  /// 原生侧需要的播放状态。直播没有时长，`isLive` 显式传 true。
-  ///
-  /// 不能靠 `duration` 反推：部分直播流（flv/hls）经 mpv 解析后会给一个有限
-  /// 时长，反推会失败，小窗就按点播渲染出进度条和快进/快退按钮。
-  Map<String, Object> _iosPipStateMap() =>
-      IosPipService.stateOf(player, isLive: true);
-
-  /// iOS 小窗进入时隐藏弹幕/控制器（与 Android 小窗表现一致）。
-  void _applyIosPipEnteredState() {
-    if (_pipStateApplied) {
-      return;
-    }
-    _pipStateApplied = true;
-    danmakuStateBeforePIP = showDanmakuState.value;
-    if (AppSettingsController.instance.pipHideDanmu.value &&
-        danmakuStateBeforePIP) {
-      setDanmakuVisible(false);
-    }
-    showControlsState.value = false;
-  }
-
-  void _restoreIosPipExitedState() {
-    if (!_pipStateApplied) {
-      return;
-    }
-    _pipStateApplied = false;
-    setDanmakuVisible(danmakuStateBeforePIP);
-  }
-
-  /// 当前视频纹理 id；未就绪时为 null。
-  int? _iosPipTextureId() {
-    final id = videoController.id.value;
-    return id == null || id < 0 ? null : id;
-  }
-
-  void _ensureIosPipBindings() {
-    if (!Platform.isIOS) {
-      return;
-    }
-    IosPipService.onSetPlaying = (playing) async {
-      if (playing) {
-        await player.play();
-      } else {
-        await player.pause();
-      }
-    };
-    IosPipService.onSkip = (delta) {
-      // 直播不可跳转：小窗不该给出可用快进/快退，这里直接忽略。
-      Log.d("直播画中画忽略跳转请求: $delta");
-    };
-    // 只在前台弹提示（后台失败静默），并清掉武装标记：原生侧没有画面了，
-    // 不能继续按"小窗已武装"在后台解码。
-    IosPipService.onError = (message) {
-      SmartDialog.showToast(message);
-      _iosAutoPipConfigured = false;
-      _iosPipActive = false;
-      _stopIosPipStateSync();
-    };
-    IosPipService.onStateChanged = (active, closedInBackground) {
-      if (active) {
-        _iosPipActive = true;
-        _applyIosPipEnteredState();
-        _startIosPipStateSync();
-        return;
-      }
-      if (closedInBackground &&
-          !AppSettingsController.instance.allowBackgroundPlayback.value) {
-        // 在后台关掉小窗时停止播放，与 Android 行为一致；开了后台播放则继续。
-        unawaited(player.pause());
-      }
-      _iosPipActive = false;
-      // 注意：`_iosAutoPipConfigured` 不在这里清。原生侧的 autoEnter 标记在
-      // 回前台停掉小窗后依然保留（下次退后台会再次自动进入），Dart 侧必须
-      // 与之一致，否则会误判"未武装"而在退后台时暂停解码。
-      if (!IosPipService.needsUpdate) {
-        _stopIosPipStateSync();
-      }
-      _restoreIosPipExitedState();
-    };
-  }
-
-  /// 小窗显示期间定时把播放进度同步给原生侧（进度条、快进按钮用）。
-  void _startIosPipStateSync() {
-    if (!Platform.isIOS) {
-      return;
-    }
-    _iosPipStateSyncTimer ??= Timer.periodic(
-      const Duration(milliseconds: 500),
-      (_) {
-        if (!IosPipService.needsUpdate) {
-          return;
-        }
-        IosPipService.update(_iosPipStateMap());
-      },
-    );
-  }
-
-  void _stopIosPipStateSync() {
-    _iosPipStateSyncTimer?.cancel();
-    _iosPipStateSyncTimer = null;
-  }
-
-  Future<void> cancelIosAutoPipOnLeave() async {
-    if (!Platform.isIOS) {
-      return;
-    }
-    _iosAutoPipConfigured = false;
-    _stopIosPipStateSync();
-    IosPipService.disableAutoEnter();
-  }
-
-  /// 配置"退到后台自动进入画中画"。
-  Future<bool> prepareIosAutoPipOnLeave() async {
-    if (!Platform.isIOS) {
-      return false;
-    }
-    if (!IosPipService.isAvailable) {
-      return false;
-    }
-    final textureId = _iosPipTextureId();
-    if (textureId == null) {
-      return false;
-    }
-    _ensureIosPipBindings();
-    IosPipService.enter(
-      textureId,
-      width: player.state.width,
-      height: player.state.height,
-      autoEnter: true,
-      state: _iosPipStateMap(),
-    );
-    _iosAutoPipConfigured = true;
-    _startIosPipStateSync();
-    return true;
-  }
-
-  /// 立即进入画中画（随后自动退到桌面，与 Android 小窗一致）。
-  Future<void> enableIosPIP() async {
-    if (!IosPipService.isAvailable) {
-      SmartDialog.showToast("设备不支持小窗播放");
-      return;
-    }
-    final textureId = _iosPipTextureId();
-    if (textureId == null) {
-      SmartDialog.showToast("画面尚未就绪，请稍后再试");
-      return;
-    }
-    _ensureIosPipBindings();
-    _iosPipActive = true;
-    _applyIosPipEnteredState();
-    IosPipService.enter(
-      textureId,
-      width: player.state.width,
-      height: player.state.height,
-      autoEnter: false,
-      state: _iosPipStateMap(),
-    );
-    _startIosPipStateSync();
-  }
-
   Future<void> cancelAutoPipOnLeave() async {
     if (Platform.isIOS) {
-      await cancelIosAutoPipOnLeave();
+      _autoPipOnLeaveConfigured = false;
+      _autoPipReconfigurePending = false;
+      try {
+        await IosPipService.disableAutoEnter();
+      } catch (e) {
+        Log.d("取消 iOS 自动画中画失败: $e");
+      }
       return;
     }
     if (!Platform.isAndroid) {
@@ -1662,7 +1492,12 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
 
   Future<bool> prepareAutoPipOnLeave() async {
     if (Platform.isIOS) {
-      return await prepareIosAutoPipOnLeave();
+      // iOS 用系统的 canStartPictureInPictureAutomaticallyFromInline，
+      // 武装一次即可，无需按视频尺寸反复重配。
+      if (_autoPipOnLeaveConfigured) return true;
+      final ok = await _startIosPip(autoEnter: true);
+      if (ok) _autoPipOnLeaveConfigured = true;
+      return ok;
     }
     if (!Platform.isAndroid) {
       return _autoPipOnLeaveConfigured;
@@ -1703,14 +1538,6 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
   }
 
   Future<void> refreshAutoPipOnVideoSize() async {
-    if (Platform.isIOS) {
-      // iOS 侧帧尺寸由原生 didTransitionToRenderSize 自行处理，这里只需
-      // 保证已进入/已武装时把最新尺寸同步过去。
-      if (_iosAutoPipConfigured || _iosPipActive) {
-        IosPipService.update(_iosPipStateMap());
-      }
-      return;
-    }
     if (!Platform.isAndroid || !_autoPipOnLeaveConfigured) {
       return;
     }
@@ -1736,10 +1563,73 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     }
   }
 
+  // ---- iOS 画中画 ----
+
+  /// 原生侧需要的播放状态。直播没有时长，`isLive` 为 true。
+  ///
+  /// 不能靠 `duration` 反推：部分直播流（flv/hls）经 mpv 解析后会给一个有限
+  /// 时长，反推会失败，小窗就按点播渲染出进度条和快进/快退按钮。
+  Map<String, Object> _iosPipStateMap() =>
+      IosPipService.stateOf(player, isLive: true);
+
+  /// 订阅 iOS 画中画事件，接进与小窗共用的状态机。
+  ///
+  /// iOS 与 Android 共用 `_applyPipEnteredState` / `_restorePipExitedState`：
+  /// 前者会置位 `androidInPipState`，播放页据此切到 PiP 简化布局。
+  void _ensureIosPipListener() {
+    if (_iosPipSub != null) return;
+    _iosPipSub = IosPipService.events.listen((event) {
+      switch (event) {
+        case IosPipEvent.entered:
+          _applyPipEnteredState();
+        case IosPipEvent.exited:
+          // 用户点小窗的恢复按钮，界面回到 App 内联显示
+          _restorePipExitedState();
+          Get.until((r) => r.routeName == RoutePath.kLiveRoomDetail);
+        case IosPipEvent.closed:
+          _restorePipExitedState();
+        case IosPipEvent.resumed:
+          player.play();
+        case IosPipEvent.paused:
+          player.pause();
+        case IosPipEvent.failed:
+          Log.d("iOS 画中画失败");
+      }
+    });
+  }
+
+  /// 启动 iOS 画中画。
+  ///
+  /// [autoEnter] 为 true 时表示退后台自动进入，等同于 Android 的
+  /// `OnLeavePiP`；false 表示用户点了小窗按钮，立即进入。
+  Future<bool> _startIosPip({required bool autoEnter}) async {
+    if (!await IosPipService.isSupported) {
+      if (!autoEnter) {
+        SmartDialog.showToast("设备不支持画中画（需 iOS 15+）");
+      }
+      return false;
+    }
+    _ensureIosPipListener();
+    // media_kit 的 `VideoController.id` 是 ValueNotifier<int?>，value 即
+    // FlutterTexture 的 id，原生侧据此取帧。
+    final textureId = videoController.id.value ?? 0;
+    final ok = await IosPipService.enter(
+      textureId: textureId,
+      width: (player.state.width ?? 16).toDouble(),
+      height: (player.state.height ?? 9).toDouble(),
+      state: _iosPipStateMap(),
+      autoEnter: autoEnter,
+    );
+    if (!ok && !autoEnter) {
+      SmartDialog.showToast("进入画中画失败");
+    }
+    return ok;
+  }
+
   Future enablePIP() async {
     if (Platform.isIOS) {
-      await cancelIosAutoPipOnLeave();
-      await enableIosPIP();
+      await cancelAutoPipOnLeave();
+      await _startIosPip(autoEnter: false);
       return;
     }
     if (!Platform.isAndroid) {
@@ -2566,7 +2456,6 @@ class PlayerController extends BaseController
     _backgroundEventSubscription?.cancel();
     _logSubscription?.cancel();
     _pipSubscription?.cancel();
-    _stopIosPipStateSync();
     _playingSubscription?.cancel();
     _surfaceHealthCheckTimer?.cancel();
     _playbackStallWatchdogTimer?.cancel();
@@ -3228,7 +3117,7 @@ class PlayerController extends BaseController
     );
   }
 
-  Future<void> closePlayerResources() async {
+  Future<void> closePlayerResources({bool exitingApp = false}) async {
     if (_playerClosing) {
       return;
     }
@@ -3237,6 +3126,13 @@ class PlayerController extends BaseController
     clearTransientPlayerOverlays();
     await stopBackgroundPlaybackService();
     await waitForPlaybackOpen();
+    // Windows 退出前先保存 mpv handle，dispose 后用于让核心立即停止。
+    int? mpvHandle;
+    if (exitingApp && Platform.isWindows) {
+      try {
+        mpvHandle = await player.handle;
+      } catch (_) {}
+    }
     await player.stop();
     if (smallWindowState.value) {
       await exitSmallWindow();
@@ -3245,6 +3141,14 @@ class PlayerController extends BaseController
     disposeDanmakuController();
     await resetSystem();
     await player.dispose();
+    // 渲染上下文已同步释放，让 mpv 核心线程在进程退出/DLL 卸载前结束。
+    if (exitingApp && Platform.isWindows && mpvHandle != null) {
+      try {
+        await MpvExitHelper.shutdown(mpvHandle);
+      } catch (e) {
+        Log.logPrint("mpv 核心退出失败: $e");
+      }
+    }
   }
 
   @override

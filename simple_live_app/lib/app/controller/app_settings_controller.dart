@@ -111,6 +111,10 @@ class AppSettingsController extends GetxController {
         .getValue(LocalStorageService.kDanmuUserShieldEnable, true);
     danmuStrokeWidth.value = LocalStorageService.instance
         .getValue(LocalStorageService.kDanmuStrokeWidth, 2.0);
+    danmuStrokeEnable.value = LocalStorageService.instance
+        .getValue(LocalStorageService.kDanmuStrokeEnable, true);
+    danmuMaxFps.value =
+        LocalStorageService.instance.getValue(LocalStorageService.kDanmuMaxFps, 0);
     danmuTopMargin.value = LocalStorageService.instance
         .getValue(LocalStorageService.kDanmuTopMargin, 0.0);
     danmuBottomMargin.value = LocalStorageService.instance
@@ -153,6 +157,9 @@ class AppSettingsController extends GetxController {
 
     playerCompatMode.value = LocalStorageService.instance
         .getValue(LocalStorageService.kPlayerCompatMode, false);
+
+    powerSaveMode.value = LocalStorageService.instance
+        .getValue(LocalStorageService.kPowerSaveMode, false);
 
     playerAutoPause.value = LocalStorageService.instance
         .getValue(LocalStorageService.kPlayerAutoPause, false);
@@ -922,6 +929,32 @@ class AppSettingsController extends GetxController {
         .setValue(LocalStorageService.kDanmuStrokeWidth, e);
   }
 
+  var danmuStrokeEnable = true.obs;
+  void setDanmuStrokeEnable(bool e) {
+    danmuStrokeEnable.value = e;
+    LocalStorageService.instance
+        .setValue(LocalStorageService.kDanmuStrokeEnable, e);
+  }
+
+  /// 弹幕渲染帧率上限：0=跟随屏幕刷新率，60=60fps
+  var danmuMaxFps = 0.obs;
+  void setDanmuMaxFps(int e) {
+    danmuMaxFps.value = e;
+    LocalStorageService.instance.setValue(LocalStorageService.kDanmuMaxFps, e);
+  }
+
+  /// 省电模式下强制关闭描边，降低每帧 drawParagraph 数量
+  bool get effectiveDanmuStroke =>
+      danmuStrokeEnable.value && !powerSaveMode.value;
+
+  /// 省电模式下强制 60fps；0 表示跟随屏幕
+  int? get effectiveDanmuMaxFps {
+    if (powerSaveMode.value) {
+      return 60;
+    }
+    return danmuMaxFps.value <= 0 ? null : danmuMaxFps.value;
+  }
+
   var danmuFontWeight = 4.obs;
   void setDanmuFontWeight(int e) {
     danmuFontWeight.value = e;
@@ -1015,6 +1048,15 @@ class AppSettingsController extends GetxController {
     playerCompatMode.value = e;
     LocalStorageService.instance
         .setValue(LocalStorageService.kPlayerCompatMode, e);
+  }
+
+  /// 省电模式：降低 mpv 缩放档位、弹幕帧率强制 60fps、关闭弹幕描边、
+  /// 放宽安卓播放看门狗、限制多开数量；进入下一个直播间后生效
+  var powerSaveMode = false.obs;
+  void setPowerSaveMode(bool e) {
+    powerSaveMode.value = e;
+    LocalStorageService.instance
+        .setValue(LocalStorageService.kPowerSaveMode, e);
   }
 
   var playerBufferSize = 32.obs;

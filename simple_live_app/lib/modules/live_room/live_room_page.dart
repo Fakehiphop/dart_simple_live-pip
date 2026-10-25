@@ -374,6 +374,9 @@ class LiveRoomPage extends GetView<LiveRoomController> {
                     duration: settings.danmuSpeed.value.toInt(),
                     opacity: opacity,
                     fontWeight: settings.danmuFontWeight.value,
+                    showStroke: settings.effectiveDanmuStroke,
+                    strokeWidth: settings.danmuStrokeWidth.value,
+                    maxFps: settings.effectiveDanmuMaxFps,
                     hideTop: true, // PIP模式只显示滚动弹幕
                     hideBottom: true,
                     hideScroll: false,
@@ -705,11 +708,9 @@ class LiveRoomPage extends GetView<LiveRoomController> {
         Video(
           key: controller.globalPlayerKey,
           controller: controller.videoController,
-          // iOS 上退后台是否暂停由控制器按"画中画是否已武装"决定：小窗已武装
-          // 时必须继续解码，否则小窗画面会冻住。
-          pauseUponEnteringBackgroundMode: !Platform.isIOS &&
+          pauseUponEnteringBackgroundMode:
               !AppSettingsController.instance.allowBackgroundPlayback.value,
-          resumeUponEnteringForegroundMode: !Platform.isIOS &&
+          resumeUponEnteringForegroundMode:
               !AppSettingsController.instance.allowBackgroundPlayback.value,
           controls:
               pipMode ? null : (state) => playerControls(state, controller),
@@ -1621,7 +1622,7 @@ class LiveRoomPage extends GetView<LiveRoomController> {
               },
             ),
             Visibility(
-              visible: Platform.isAndroid || Platform.isIOS,
+              visible: Platform.isAndroid,
               child: ListTile(
                 leading: const Icon(Icons.picture_in_picture),
                 title: const Text("小窗播放"),

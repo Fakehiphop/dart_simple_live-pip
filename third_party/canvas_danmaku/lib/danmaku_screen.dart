@@ -65,6 +65,30 @@ class _DanmakuScreenState extends State<DanmakuScreen>
 
   late final _random = Random();
 
+  /// 限帧后的重绘信号（滚动/高级弹幕层）；值无意义，只用于触发重绘
+  final ValueNotifier<int> _paintTick = ValueNotifier<int>(0);
+  int _lastPaintAtMs = 0;
+
+  /// 相邻两次重绘的最小间隔；0 = 跟随屏幕刷新率
+  int _paintFrameIntervalMs = 0;
+
+  void _updatePaintFrameInterval() {
+    final maxFps = _option.maxFps;
+    // 向下取整（60fps → 16ms）：60Hz 屏 vsync 间隔约 16.67ms，
+    // 若取 17ms 会隔帧才通过，反而把 60Hz 设备降到 30fps
+    _paintFrameIntervalMs =
+        (maxFps == null || maxFps <= 0) ? 0 : (1000 / maxFps).floor();
+  }
+
+  void _onAnimationTick() {
+    final now = _tick;
+    final interval = _paintFrameIntervalMs;
+    if (interval <= 0 || now - _lastPaintAtMs >= interval) {
+      _lastPaintAtMs = now;
+      _paintTick.value = now;
+    }
+  }
+
   /// 内部计时器
   int get _tick => _stopwatch.elapsedMilliseconds;
 
@@ -107,6 +131,9 @@ class _DanmakuScreenState extends State<DanmakuScreen>
       duration: Duration(seconds: _option.duration),
     );
 
+    _animationController.addListener(_onAnimationTick);
+    _updatePaintFrameInterval();
+
     WidgetsBinding.instance.addObserver(this);
   }
 
@@ -135,6 +162,7 @@ class _DanmakuScreenState extends State<DanmakuScreen>
     WidgetsBinding.instance.removeObserver(this);
     _animationController.dispose();
     _staticAnimationController.dispose();
+    _paintTick.dispose();
     _emojiImageCache.clear();
     _stopwatch.stop();
     super.dispose();
@@ -187,7 +215,9 @@ class _DanmakuScreenState extends State<DanmakuScreen>
           text: TextSpan(
             text: content.text,
             style: TextStyle(
-              color: content.color,
+              color: content.color.withOpacity(
+                content.color.opacity * _option.opacity,
+              ),
               fontSize: content.fontSize,
               fontWeight: FontWeight.values[_option.fontWeight],
               fontFamily: _option.fontFamily,
@@ -195,7 +225,9 @@ class _DanmakuScreenState extends State<DanmakuScreen>
                   ? [
                       Shadow(
                         color: Colors.black.withOpacity(
-                          content.alphaTween?.begin ?? content.color.opacity,
+                          (content.alphaTween?.begin ??
+                                  content.color.opacity) *
+                              _option.opacity,
                         ),
                         blurRadius: 2,
                       ),
@@ -248,6 +280,7 @@ class _DanmakuScreenState extends State<DanmakuScreen>
         _option.fontWeight,
         _option.emojiScale,
         _option.fontFamily,
+        _option.opacity,
       );
 
       ui.Paragraph? strokeParagraph;
@@ -259,6 +292,8 @@ class _DanmakuScreenState extends State<DanmakuScreen>
           _option.fontWeight,
           _option.emojiScale,
           _option.fontFamily,
+          _option.opacity,
+          _option.strokeWidth,
         );
       }
 
@@ -434,6 +469,13 @@ class _DanmakuScreenState extends State<DanmakuScreen>
     if (option.emojiScale != _option.emojiScale) {
       needClearParagraph = true;
     }
+    if (option.opacity != _option.opacity) {
+      // 透明度已并入 Paragraph 颜色 alpha，变化时需重建缓存
+      needClearParagraph = true;
+    }
+    if (option.strokeWidth != _option.strokeWidth) {
+      needClearParagraph = true;
+    }
     if (option.duration != _option.duration) {
       _animationController.duration = Duration(seconds: option.duration);
       _staticAnimationController.duration = Duration(seconds: option.duration);
@@ -454,6 +496,7 @@ class _DanmakuScreenState extends State<DanmakuScreen>
     }
     _option = option;
     _controller.option = _option;
+    _updatePaintFrameInterval();
 
     /// 清理已经存在的 Paragraph 缓存
     if (needClearParagraph) {
@@ -503,6 +546,8 @@ class _DanmakuScreenState extends State<DanmakuScreen>
         a.hideScroll == b.hideScroll &&
         a.hideSpecial == b.hideSpecial &&
         a.showStroke == b.showStroke &&
+        a.strokeWidth == b.strokeWidth &&
+        a.maxFps == b.maxFps &&
         a.massiveMode == b.massiveMode &&
         a.safeArea == b.safeArea;
   }
@@ -671,78 +716,80 @@ class _DanmakuScreenState extends State<DanmakuScreen>
         }
         return ClipRect(
           child: IgnorePointer(
-            child: Opacity(
-              opacity: _option.opacity,
-              child: Stack(
-                children: [
-                  RepaintBoundary(
-                    child: AnimatedBuilder(
-                      animation: _animationController,
-                      builder: (context, child) {
-                        return CustomPaint(
-                          painter: ScrollDanmakuPainter(
-                            _animationController.value,
-                            _scrollDanmakuItems,
-                            _option.duration,
-                            _option.fontSize,
-                            _option.fontWeight,
-                            _option.fontFamily,
-                            _option.showStroke,
-                            _danmakuHeight,
-                            _running,
-                            _tick,
-                            _emojiImageCache,
-                          ),
-                          child: Container(),
-                        );
-                      },
-                    ),
+            child: Stack(
+              children: [
+                RepaintBoundary(
+                  child: ValueListenableBuilder<int>(
+                    valueListenable: _paintTick,
+                    builder: (context, value, child) {
+                      return CustomPaint(
+                        painter: ScrollDanmakuPainter(
+                          _animationController.value,
+                          _scrollDanmakuItems,
+                          _option.duration,
+                          _option.fontSize,
+                          _option.fontWeight,
+                          _option.fontFamily,
+                          _option.showStroke,
+                          _option.strokeWidth,
+                          _option.opacity,
+                          _danmakuHeight,
+                          _running,
+                          _tick,
+                          _emojiImageCache,
+                        ),
+                        child: Container(),
+                      );
+                    },
                   ),
-                  RepaintBoundary(
-                    child: AnimatedBuilder(
-                      animation: _staticAnimationController,
-                      builder: (context, child) {
-                        return CustomPaint(
-                          painter: StaticDanmakuPainter(
-                            _staticAnimationController.value,
-                            _topDanmakuItems,
-                            _bottomDanmakuItems,
-                            _option.duration,
-                            _option.fontSize,
-                            _option.fontWeight,
-                            _option.fontFamily,
-                            _option.showStroke,
-                            _danmakuHeight,
-                            _running,
-                            _tick,
-                            _emojiImageCache,
-                          ),
-                          child: Container(),
-                        );
-                      },
-                    ),
+                ),
+                RepaintBoundary(
+                  child: AnimatedBuilder(
+                    animation: _staticAnimationController,
+                    builder: (context, child) {
+                      return CustomPaint(
+                        painter: StaticDanmakuPainter(
+                          _staticAnimationController.value,
+                          _topDanmakuItems,
+                          _bottomDanmakuItems,
+                          _option.duration,
+                          _option.fontSize,
+                          _option.fontWeight,
+                          _option.fontFamily,
+                          _option.showStroke,
+                          _option.strokeWidth,
+                          _option.opacity,
+                          _danmakuHeight,
+                          _running,
+                          _tick,
+                          _emojiImageCache,
+                        ),
+                        child: Container(),
+                      );
+                    },
                   ),
-                  RepaintBoundary(
-                    child: AnimatedBuilder(
-                      animation: _animationController, // 与滚动弹幕共用控制器
-                      builder: (context, child) {
-                        return CustomPaint(
-                          painter: SpecialDanmakuPainter(
-                            _animationController.value,
-                            _specialDanmakuItems,
-                            _option.fontSize,
-                            _option.fontWeight,
-                            _option.fontFamily,
-                            _running,
-                            _tick,
-                          ),
-                          child: Container(),
-                        );
-                      },
-                    ),
+                ),
+                RepaintBoundary(
+                  child: ValueListenableBuilder<int>(
+                    valueListenable: _paintTick, // 与滚动弹幕共用限帧信号
+                    builder: (context, value, child) {
+                      return CustomPaint(
+                        painter: SpecialDanmakuPainter(
+                          _animationController.value,
+                          _specialDanmakuItems,
+                          _option.fontSize,
+                          _option.fontWeight,
+                          _option.fontFamily,
+                          _running,
+                          _tick,
+                          _option.opacity,
+                        ),
+                        child: Container(),
+                      );
+                    },
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
         );

@@ -12,6 +12,8 @@ class StaticDanmakuPainter extends CustomPainter {
   final int fontWeight;
   final String? fontFamily;
   final bool showStroke;
+  final double strokeWidth;
+  final double opacity;
   final double danmakuHeight;
   final bool running;
   final int tick;
@@ -30,6 +32,8 @@ class StaticDanmakuPainter extends CustomPainter {
     this.fontWeight,
     this.fontFamily,
     this.showStroke,
+    this.strokeWidth,
+    this.opacity,
     this.danmakuHeight,
     this.running,
     this.tick,
@@ -49,6 +53,7 @@ class StaticDanmakuPainter extends CustomPainter {
         fontWeight,
         1.25,
         fontFamily,
+        opacity,
       );
 
       // 黑色部分
@@ -60,6 +65,8 @@ class StaticDanmakuPainter extends CustomPainter {
           fontWeight,
           1.25,
           fontFamily,
+          opacity,
+          strokeWidth,
         );
 
         if (item.strokeParagraph != null) {
@@ -86,6 +93,7 @@ class StaticDanmakuPainter extends CustomPainter {
         item.content,
         offset,
         emojiImageCache,
+        opacity,
       );
     }
     // 绘制底部弹幕 (翻转绘制)
@@ -99,6 +107,7 @@ class StaticDanmakuPainter extends CustomPainter {
         fontWeight,
         1.25,
         fontFamily,
+        opacity,
       );
 
       // 黑色部分
@@ -110,6 +119,8 @@ class StaticDanmakuPainter extends CustomPainter {
           fontWeight,
           1.25,
           fontFamily,
+          opacity,
+          strokeWidth,
         );
 
         if (item.strokeParagraph != null) {
@@ -146,6 +157,7 @@ class StaticDanmakuPainter extends CustomPainter {
         item.content,
         offset,
         emojiImageCache,
+        opacity,
       );
     }
   }

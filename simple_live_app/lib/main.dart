@@ -33,7 +33,6 @@ import 'package:simple_live_app/services/douyu_account_service.dart';
 import 'package:simple_live_app/services/db_service.dart';
 import 'package:simple_live_app/services/follow_service.dart';
 import 'package:simple_live_app/services/kuaishou_account_service.dart';
-import 'package:simple_live_app/services/ios_pip_service.dart';
 import 'package:simple_live_app/services/live_subtitle_service.dart';
 import 'package:simple_live_app/services/local_storage_service.dart';
 import 'package:simple_live_app/services/profile_backup_service.dart';
@@ -409,10 +408,11 @@ class _DesktopWindowLifecycle with WindowListener {
       "关闭播放器",
       () async {
         if (Get.isRegistered<LiveRoomController>()) {
-          await Get.find<LiveRoomController>().closePlayerResources();
+          await Get.find<LiveRoomController>()
+              .closePlayerResources(exitingApp: true);
         }
       },
-      timeout: const Duration(milliseconds: 900),
+      timeout: const Duration(milliseconds: 4000),
     );
     _closeStepSync("关闭同步服务", () {
       if (Get.isRegistered<SyncService>()) {
@@ -488,11 +488,6 @@ Future initServices() async {
   Get.put(FollowService());
   Get.put(LiveSubtitleService());
   Get.put(ProfileBackupService());
-
-  // iOS 画中画可用性探测（原生实现见 ios/Runner/PipPlugin.swift）
-  if (Platform.isIOS) {
-    await IosPipService.init();
-  }
 
   if (DesktopStartupArgs.isSecondaryDesktopInstance) {
     Log.i("Skip SyncService for desktop secondary player instance");

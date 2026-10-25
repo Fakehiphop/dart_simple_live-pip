@@ -128,13 +128,18 @@ class MultiRoomPlayerController extends GetxController {
       throw Exception("无法读取播放清晰度");
     }
     _qualities = qualities;
-    final qualityLevel = AppSettingsController.instance.qualityLevel.value;
-    if (qualityLevel == 2) {
-      _qualityIndex = 0;
-    } else if (qualityLevel == 0) {
+    if (AppSettingsController.instance.powerSaveMode.value) {
+      // 省电模式：多开每路都是全量解码渲染，统一压到最低清晰度档
       _qualityIndex = _qualities.length - 1;
     } else {
-      _qualityIndex = (_qualities.length / 2).floor();
+      final qualityLevel = AppSettingsController.instance.qualityLevel.value;
+      if (qualityLevel == 2) {
+        _qualityIndex = 0;
+      } else if (qualityLevel == 0) {
+        _qualityIndex = _qualities.length - 1;
+      } else {
+        _qualityIndex = (_qualities.length / 2).floor();
+      }
     }
     qualityInfo.value = _qualities[_qualityIndex].quality;
   }

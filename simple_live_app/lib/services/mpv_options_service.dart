@@ -48,6 +48,18 @@ class MpvOptionsService {
       "sigmoid-upscaling": "yes",
       "deband": "yes",
     },
+    // 省电模式下的画质档替代：spline36 缩放，避开 gpu-next 与
+    // EWA/sigmoid/deband 等每帧额外着色器 pass
+    "qualityPowerSave": {
+      "hwdec": "auto-safe",
+      "vo": "gpu",
+      "scale": "spline36",
+      "cscale": "spline36",
+      "dscale": "mitchell",
+      "correct-downscaling": "no",
+      "sigmoid-upscaling": "no",
+      "deband": "no",
+    },
   };
 
   static Map<String, String> effectiveOptions() {
@@ -186,7 +198,17 @@ class MpvOptionsService {
 
   static Map<String, String> _profileOptionsForPlatform(String profile) {
     Map<String, String> base;
-    if (profile == "balanced") {
+    final powerSave = AppSettingsController.instance.powerSaveMode.value;
+    if (powerSave) {
+      // 省电模式：均衡→bilinear，画质→spline36，流畅档本就是 bilinear 不变
+      final powerSaveKey = profile == "balanced"
+          ? "performance"
+          : profile == "quality"
+          ? "qualityPowerSave"
+          : profile;
+      base =
+          desktopProfiles[powerSaveKey] ?? desktopProfiles["performance"]!;
+    } else if (profile == "balanced") {
       base = Platform.isWindows
           ? desktopProfiles["balanced"]!
           : desktopProfiles["balancedDesktop"]!;
@@ -217,6 +239,7 @@ class MpvOptionsService {
     }
 
     return "profile=${AppSettingsController.instance.mpvProfile.value}, "
+        "powerSave=${AppSettingsController.instance.powerSaveMode.value}, "
         "hardwareDecode=${AppSettingsController.instance.hardwareDecode.value}, "
         "vo=${value("vo")}, hwdec=${value("hwdec")}, "
         "mpvOptions=${options.length}";

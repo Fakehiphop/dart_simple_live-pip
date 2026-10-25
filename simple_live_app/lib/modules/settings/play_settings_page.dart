@@ -42,6 +42,16 @@ class PlaySettingsPage extends GetView<AppSettingsController> {
               children: [
                 Obx(
                   () => SettingsSwitch(
+                    title: "省电模式",
+                    subtitle: "降低发热：简化视频缩放算法、弹幕帧率限 60、关闭弹幕描边、"
+                        "放宽播放检测频率、限制多开数量；画质略降，进入下一个直播间后生效",
+                    value: controller.powerSaveMode.value,
+                    onChanged: controller.setPowerSaveMode,
+                  ),
+                ),
+                AppStyle.divider,
+                Obx(
+                  () => SettingsSwitch(
                     title: Platform.isIOS ? "硬件加速" : "硬件解码",
                     value: controller.hardwareDecode.value,
                     subtitle: Platform.isIOS
@@ -137,234 +147,9 @@ class PlaySettingsPage extends GetView<AppSettingsController> {
                     },
                   ),
                 ),
-                AppStyle.divider,
-                Obx(
-                  () => SettingsSwitch(
-                    title: "滑动调节音量/亮度",
-                    subtitle: "播放页左右两侧上下滑动调节亮度和音量",
-                    value: controller.playerGestureControlEnable.value,
-                    onChanged: (e) {
-                      controller.setPlayerGestureControlEnable(e);
-                    },
-                  ),
-                ),
-                AppStyle.divider,
-                Obx(
-                  () => SettingsSwitch(
-                    title: "允许后台继续播放",
-                    subtitle: "移动端仍可能被系统省电策略关闭，返回前台时会尽量自动恢复",
-                    value: controller.allowBackgroundPlayback.value,
-                    onChanged: (e) {
-                      controller.setAllowBackgroundPlayback(e);
-                    },
-                  ),
-                ),
-                if (Platform.isAndroid) AppStyle.divider,
-                if (Platform.isAndroid)
-                  Obx(
-                    () => SettingsSwitch(
-                      title: "与其他应用同时播放",
-                      subtitle:
-                          "开启后不再申请音频焦点，可能与其它应用同时出声；来电、蓝牙/车机等场景可能异常",
-                      value: controller.allowConcurrentAudio.value,
-                      onChanged: (e) {
-                        controller.setAllowConcurrentAudio(e);
-                        BackgroundPlaybackService.instance
-                            .applyAudioFocusPreference(requestAudioFocus: !e);
-                      },
-                    ),
-                  ),
-                if (Platform.isAndroid || Platform.isIOS) AppStyle.divider,
-                if (Platform.isAndroid || Platform.isIOS)
-                  SettingsAction(
-                    title: "后台保活设置指引",
-                    subtitle: "按手机品牌设置自启动与电池策略，避免后台被清理",
-                    onTap: () => Get.toNamed(
-                      RoutePath.kSettingsBackgroundKeepalive,
-                    ),
-                  ),
               ],
             ),
           ),
-          if (LiveSubtitleService.instance.uiEnabled) ...[
-            Padding(
-              padding: AppStyle.edgeInsetsA12.copyWith(top: 24),
-              child: Text(
-                "实时字幕（实验）",
-                style: Get.textTheme.titleSmall,
-              ),
-            ),
-            SettingsCard(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Obx(
-                    () => SettingsSwitch(
-                      title: "启用实时字幕",
-                      subtitle:
-                          "需要先选择本机模型路径，${LiveSubtitleService.instance.platformStatusLabel}",
-                      value: controller.liveSubtitleEnable.value,
-                      onChanged: (e) async {
-                        if (e) {
-                          if (!LiveSubtitleService.instance.canStartRuntime) {
-                            SmartDialog.showToast("当前平台暂不支持实时字幕识别");
-                            return;
-                          }
-                          final hasModel = await LiveSubtitleService.instance
-                              .validateModelPath(
-                            controller.liveSubtitleModelPath.value,
-                          );
-                          if (!hasModel) {
-                            SmartDialog.showToast("请先选择有效的字幕模型路径");
-                            return;
-                          }
-                        }
-                        controller.setLiveSubtitleEnable(e);
-                        await LiveSubtitleService.instance
-                            .syncPreviewFromSettings();
-                      },
-                    ),
-                  ),
-                  AppStyle.divider,
-                  Obx(
-                    () {
-                      final modelPath = controller.liveSubtitleModelPath.value;
-                      final label =
-                          modelPath.isEmpty ? "未选择" : p.basename(modelPath);
-                      return SettingsAction(
-                        title: "模型关键文件",
-                        subtitle: LiveSubtitleService.instance
-                            .modelPathSubtitle(modelPath),
-                        value: label,
-                        onTap: pickSubtitleModelPath,
-                      );
-                    },
-                  ),
-                  AppStyle.divider,
-                  SettingsAction(
-                    title: "模型推荐下载",
-                    subtitle: "按设备性能选择高级 / 中级 / 甜点级模型",
-                    onTap: showSubtitleModelRecommendations,
-                  ),
-                  AppStyle.divider,
-                  Obx(
-                    () => SettingsMenu<String>(
-                      title: "字幕语言",
-                      value: controller.liveSubtitleLanguage.value,
-                      valueMap: const {
-                        "auto": "自动",
-                        "zh": "中文",
-                        "en": "英语",
-                        "ja": "日语",
-                        "ko": "韩语",
-                      },
-                      onChanged: (e) async {
-                        controller.setLiveSubtitleLanguage(e);
-                        await LiveSubtitleService.instance
-                            .syncPreviewFromSettings();
-                      },
-                    ),
-                  ),
-                  AppStyle.divider,
-                  Obx(
-                    () => SettingsNumber(
-                      title: "字幕字号",
-                      value: controller.liveSubtitleFontSize.value.toInt(),
-                      min: 12,
-                      max: 36,
-                      unit: "px",
-                      onChanged: (e) {
-                        controller.setLiveSubtitleFontSize(e.toDouble());
-                      },
-                    ),
-                  ),
-                  AppStyle.divider,
-                  Obx(
-                    () => SettingsNumber(
-                      title: "水平位置",
-                      value:
-                          (controller.liveSubtitleOffsetX.value * 100).round(),
-                      min: 5,
-                      max: 95,
-                      unit: "%",
-                      onChanged: (e) {
-                        controller.setLiveSubtitleOffset(x: e / 100);
-                      },
-                    ),
-                  ),
-                  AppStyle.divider,
-                  Obx(
-                    () => SettingsNumber(
-                      title: "垂直位置",
-                      value:
-                          (controller.liveSubtitleOffsetY.value * 100).round(),
-                      min: 8,
-                      max: 92,
-                      unit: "%",
-                      onChanged: (e) {
-                        controller.setLiveSubtitleOffset(y: e / 100);
-                      },
-                    ),
-                  ),
-                  AppStyle.divider,
-                  Obx(
-                    () => SettingsMenu<int>(
-                      title: "字幕颜色",
-                      value: controller.liveSubtitleColor.value,
-                      valueMap: const {
-                        0xffffffff: "白色",
-                        0xffffeb3b: "黄色",
-                        0xff80cbc4: "青绿色",
-                        0xffffb3c7: "粉色",
-                        0xff111111: "黑色",
-                      },
-                      onChanged: (e) {
-                        controller.setLiveSubtitleColor(e);
-                      },
-                    ),
-                  ),
-                  AppStyle.divider,
-                  Obx(
-                    () => SettingsMenu<int>(
-                      title: "字幕粗细",
-                      value: controller.liveSubtitleFontWeight.value,
-                      valueMap: const {
-                        4: "正常",
-                        5: "中等",
-                        6: "半粗",
-                        7: "加粗",
-                        8: "很粗",
-                      },
-                      onChanged: (e) {
-                        controller.setLiveSubtitleFontWeight(e);
-                      },
-                    ),
-                  ),
-                  AppStyle.divider,
-                  Obx(
-                    () => SettingsSwitch(
-                      title: "字幕背景",
-                      value: controller.liveSubtitleBackgroundEnable.value,
-                      onChanged: (e) {
-                        controller.setLiveSubtitleBackgroundEnable(e);
-                      },
-                    ),
-                  ),
-                  AppStyle.divider,
-                  Obx(
-                    () => SettingsSwitch(
-                      title: "锁定字幕位置",
-                      subtitle: "锁定后播放页只显示字幕，鼠标悬停时显示解锁按钮",
-                      value: controller.liveSubtitlePositionLocked.value,
-                      onChanged: (e) {
-                        controller.setLiveSubtitlePositionLocked(e);
-                      },
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
           Padding(
             padding: AppStyle.edgeInsetsA12.copyWith(top: 24),
             child: Text(
@@ -409,8 +194,54 @@ class PlaySettingsPage extends GetView<AppSettingsController> {
                 ),
                 AppStyle.divider,
                 Obx(
+                  () => SettingsSwitch(
+                    title: "允许后台继续播放",
+                    subtitle: "移动端仍可能被系统省电策略关闭，返回前台时会尽量自动恢复",
+                    value: controller.allowBackgroundPlayback.value,
+                    onChanged: (e) {
+                      controller.setAllowBackgroundPlayback(e);
+                    },
+                  ),
+                ),
+                if (Platform.isAndroid) AppStyle.divider,
+                if (Platform.isAndroid)
+                  Obx(
+                    () => SettingsSwitch(
+                      title: "与其他应用同时播放",
+                      subtitle:
+                          "开启后不再申请音频焦点，可能与其它应用同时出声；来电、蓝牙/车机等场景可能异常",
+                      value: controller.allowConcurrentAudio.value,
+                      onChanged: (e) {
+                        controller.setAllowConcurrentAudio(e);
+                        BackgroundPlaybackService.instance
+                            .applyAudioFocusPreference(requestAudioFocus: !e);
+                      },
+                    ),
+                  ),
+                if (Platform.isAndroid || Platform.isIOS) AppStyle.divider,
+                if (Platform.isAndroid || Platform.isIOS)
+                  SettingsAction(
+                    title: "后台保活设置指引",
+                    subtitle: "按手机品牌设置自启动与电池策略，避免后台被清理",
+                    onTap: () => Get.toNamed(
+                      RoutePath.kSettingsBackgroundKeepalive,
+                    ),
+                  ),
+                AppStyle.divider,
+                Obx(
+                  () => SettingsSwitch(
+                    title: "滑动调节音量/亮度",
+                    subtitle: "播放页左右两侧上下滑动调节亮度和音量",
+                    value: controller.playerGestureControlEnable.value,
+                    onChanged: (e) {
+                      controller.setPlayerGestureControlEnable(e);
+                    },
+                  ),
+                ),
+                AppStyle.divider,
+                Obx(
                   () => Visibility(
-                    visible: Platform.isAndroid || Platform.isIOS,
+                    visible: Platform.isAndroid,
                     child: SettingsSwitch(
                       title: "进入小窗隐藏弹幕",
                       value: controller.pipHideDanmu.value,
@@ -420,10 +251,10 @@ class PlaySettingsPage extends GetView<AppSettingsController> {
                     ),
                   ),
                 ),
-                if (Platform.isAndroid || Platform.isIOS) AppStyle.divider,
+                if (Platform.isAndroid) AppStyle.divider,
                 Obx(
                   () => Visibility(
-                    visible: Platform.isAndroid || Platform.isIOS,
+                    visible: Platform.isAndroid,
                     child: SettingsSwitch(
                       title: "退出时自动小窗",
                       subtitle: "按 Home 键或系统手势退到后台时进入小窗；应用内返回仍回到主页",
@@ -651,6 +482,185 @@ class PlaySettingsPage extends GetView<AppSettingsController> {
               ],
             ),
           ),
+          if (LiveSubtitleService.instance.uiEnabled) ...[
+            Padding(
+              padding: AppStyle.edgeInsetsA12.copyWith(top: 24),
+              child: Text(
+                "实时字幕（实验）",
+                style: Get.textTheme.titleSmall,
+              ),
+            ),
+            SettingsCard(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Obx(
+                    () => SettingsSwitch(
+                      title: "启用实时字幕",
+                      subtitle:
+                          "需要先选择本机模型路径，${LiveSubtitleService.instance.platformStatusLabel}",
+                      value: controller.liveSubtitleEnable.value,
+                      onChanged: (e) async {
+                        if (e) {
+                          if (!LiveSubtitleService.instance.canStartRuntime) {
+                            SmartDialog.showToast("当前平台暂不支持实时字幕识别");
+                            return;
+                          }
+                          final hasModel = await LiveSubtitleService.instance
+                              .validateModelPath(
+                            controller.liveSubtitleModelPath.value,
+                          );
+                          if (!hasModel) {
+                            SmartDialog.showToast("请先选择有效的字幕模型路径");
+                            return;
+                          }
+                        }
+                        controller.setLiveSubtitleEnable(e);
+                        await LiveSubtitleService.instance
+                            .syncPreviewFromSettings();
+                      },
+                    ),
+                  ),
+                  AppStyle.divider,
+                  Obx(
+                    () {
+                      final modelPath = controller.liveSubtitleModelPath.value;
+                      final label =
+                          modelPath.isEmpty ? "未选择" : p.basename(modelPath);
+                      return SettingsAction(
+                        title: "模型关键文件",
+                        subtitle: LiveSubtitleService.instance
+                            .modelPathSubtitle(modelPath),
+                        value: label,
+                        onTap: pickSubtitleModelPath,
+                      );
+                    },
+                  ),
+                  AppStyle.divider,
+                  SettingsAction(
+                    title: "模型推荐下载",
+                    subtitle: "按设备性能选择高级 / 中级 / 甜点级模型",
+                    onTap: showSubtitleModelRecommendations,
+                  ),
+                  AppStyle.divider,
+                  Obx(
+                    () => SettingsMenu<String>(
+                      title: "字幕语言",
+                      value: controller.liveSubtitleLanguage.value,
+                      valueMap: const {
+                        "auto": "自动",
+                        "zh": "中文",
+                        "en": "英语",
+                        "ja": "日语",
+                        "ko": "韩语",
+                      },
+                      onChanged: (e) async {
+                        controller.setLiveSubtitleLanguage(e);
+                        await LiveSubtitleService.instance
+                            .syncPreviewFromSettings();
+                      },
+                    ),
+                  ),
+                  AppStyle.divider,
+                  Obx(
+                    () => SettingsNumber(
+                      title: "字幕字号",
+                      value: controller.liveSubtitleFontSize.value.toInt(),
+                      min: 12,
+                      max: 36,
+                      unit: "px",
+                      onChanged: (e) {
+                        controller.setLiveSubtitleFontSize(e.toDouble());
+                      },
+                    ),
+                  ),
+                  AppStyle.divider,
+                  Obx(
+                    () => SettingsNumber(
+                      title: "水平位置",
+                      value:
+                          (controller.liveSubtitleOffsetX.value * 100).round(),
+                      min: 5,
+                      max: 95,
+                      unit: "%",
+                      onChanged: (e) {
+                        controller.setLiveSubtitleOffset(x: e / 100);
+                      },
+                    ),
+                  ),
+                  AppStyle.divider,
+                  Obx(
+                    () => SettingsNumber(
+                      title: "垂直位置",
+                      value:
+                          (controller.liveSubtitleOffsetY.value * 100).round(),
+                      min: 8,
+                      max: 92,
+                      unit: "%",
+                      onChanged: (e) {
+                        controller.setLiveSubtitleOffset(y: e / 100);
+                      },
+                    ),
+                  ),
+                  AppStyle.divider,
+                  Obx(
+                    () => SettingsMenu<int>(
+                      title: "字幕颜色",
+                      value: controller.liveSubtitleColor.value,
+                      valueMap: const {
+                        0xffffffff: "白色",
+                        0xffffeb3b: "黄色",
+                        0xff80cbc4: "青绿色",
+                        0xffffb3c7: "粉色",
+                        0xff111111: "黑色",
+                      },
+                      onChanged: (e) {
+                        controller.setLiveSubtitleColor(e);
+                      },
+                    ),
+                  ),
+                  AppStyle.divider,
+                  Obx(
+                    () => SettingsMenu<int>(
+                      title: "字幕粗细",
+                      value: controller.liveSubtitleFontWeight.value,
+                      valueMap: const {
+                        4: "正常",
+                        5: "中等",
+                        6: "半粗",
+                        7: "加粗",
+                        8: "很粗",
+                      },
+                      onChanged: (e) {
+                        controller.setLiveSubtitleFontWeight(e);
+                      },
+                    ),
+                  ),
+                  AppStyle.divider,
+                  Obx(
+                    () => SettingsSwitch(
+                      title: "字幕背景",
+                      value: controller.liveSubtitleBackgroundEnable.value,
+                      onChanged: (e) {
+                        controller.setLiveSubtitleBackgroundEnable(e);
+                      },
+                    ),
+                  ),
+                  AppStyle.divider,
+                  Obx(
+                    () => SettingsSwitch(
+                      title: "锁定字幕位置",
+                      subtitle: "锁定后播放页只显示字幕，鼠标悬停时显示解锁按钮",
+                      value: controller.liveSubtitlePositionLocked.value,
+                      onChanged: (e) {
+                        controller.setLiveSubtitlePositionLocked(e);
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
         ],
       ),
     );

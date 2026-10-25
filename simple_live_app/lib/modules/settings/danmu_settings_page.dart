@@ -98,6 +98,9 @@ class DanmuSettingsView extends GetView<AppSettingsController> {
           fontWeight: fontWeight ?? controller.danmuFontWeight.value,
           duration: duration ?? controller.danmuSpeed.value.toInt(),
           opacity: opacity ?? controller.danmuOpacity.value,
+          showStroke: controller.effectiveDanmuStroke,
+          strokeWidth: controller.danmuStrokeWidth.value,
+          maxFps: controller.effectiveDanmuMaxFps,
           hideTop: hideDanmu,
           hideBottom: hideDanmu,
           hideScroll: hideDanmu,
@@ -175,15 +178,6 @@ class DanmuSettingsView extends GetView<AppSettingsController> {
               ),
               AppStyle.divider,
               Obx(
-                () => SettingsSwitch(
-                  title: "显示弹幕表情",
-                  value: controller.danmuRenderEmoji.value,
-                  onChanged: controller.setDanmuRenderEmoji,
-                ),
-              ),
-              AppStyle.divider,
-              // 显示区域和显示几行 - 提到前面
-              Obx(
                 () => SettingsNumber(
                   title: "显示区域",
                   value: (controller.danmuArea.value * 100).toInt(),
@@ -240,7 +234,142 @@ class DanmuSettingsView extends GetView<AppSettingsController> {
                 ),
               ),
               AppStyle.divider,
-              // 动态设置 - 移到后面
+              Obx(
+                () => SettingsSwitch(
+                  title: "显示弹幕表情",
+                  value: controller.danmuRenderEmoji.value,
+                  onChanged: controller.setDanmuRenderEmoji,
+                ),
+              ),
+              AppStyle.divider,
+              Obx(
+                () => SettingsNumber(
+                  title: "滚动速度",
+                  subtitle: "弹幕持续时间（秒），越小速度越快",
+                  value: controller.danmuSpeed.value.toInt(),
+                  min: 1,
+                  max: 30,
+                  onChanged: (e) {
+                    controller.setDanmuSpeed(e.toDouble());
+                    updatePreviewOption(duration: e);
+                  },
+                ),
+              ),
+              AppStyle.divider,
+              Obx(
+                () => SettingsNumber(
+                  title: "不透明度",
+                  value: (controller.danmuOpacity.value * 100).toInt(),
+                  min: 10,
+                  max: 100,
+                  step: 10,
+                  unit: "%",
+                  onChanged: (e) {
+                    controller.setDanmuOpacity(e / 100.0);
+                    updatePreviewOption(opacity: e / 100.0);
+                  },
+                ),
+              ),
+              AppStyle.divider,
+              Obx(
+                () => SettingsNumber(
+                  title: "字体大小",
+                  value: controller.danmuSize.value.toInt(),
+                  min: 8,
+                  max: 180,
+                  onChanged: (e) {
+                    final nextFontSize = e.toDouble();
+                    controller.setDanmuSize(nextFontSize);
+                    final nextMaxLines =
+                        controller.estimateDanmuMaxVisibleLineCount(
+                      viewportHeight: effectiveViewportHeight,
+                      fontSize: nextFontSize,
+                    );
+                    if (controller.danmuLineCount.value > nextMaxLines) {
+                      controller.setDanmuLineCount(nextMaxLines);
+                    }
+                    updatePreviewOption(fontSize: nextFontSize);
+                  },
+                ),
+              ),
+              AppStyle.divider,
+              Obx(
+                () => SettingsNumber(
+                  title: "字体粗细",
+                  value: controller.danmuFontWeight.value,
+                  min: 1,
+                  max: 9,
+                  step: 1,
+                  displayValue: [
+                    "极细",
+                    "很细",
+                    "细",
+                    "正常",
+                    "小粗",
+                    "偏粗",
+                    "粗",
+                    "很粗",
+                    "极粗",
+                  ][controller.danmuFontWeight.value - 1],
+                  onChanged: (e) {
+                    controller.setDanmuFontWeight(e);
+                    updatePreviewOption(fontWeight: e);
+                  },
+                ),
+              ),
+              AppStyle.divider,
+              Obx(
+                () => SettingsSwitch(
+                  title: "弹幕描边",
+                  subtitle: controller.powerSaveMode.value
+                      ? "省电模式下已强制关闭"
+                      : "为弹幕加黑色描边提升可读性，关闭可降低发热",
+                  value: controller.danmuStrokeEnable.value,
+                  onChanged: controller.setDanmuStrokeEnable,
+                ),
+              ),
+              AppStyle.divider,
+              Obx(
+                () => SettingsNumber(
+                  title: "描边宽度",
+                  value: (controller.danmuStrokeWidth.value * 2).round(),
+                  min: 2,
+                  max: 8,
+                  step: 1,
+                  displayValue:
+                      "${(controller.danmuStrokeWidth.value * 2).round() / 2}",
+                  onChanged: (e) {
+                    controller.setDanmuStrokeWidth(e / 2.0);
+                    updatePreviewOption();
+                  },
+                ),
+              ),
+              AppStyle.divider,
+              Obx(
+                () => SettingsMenu<int>(
+                  title: "帧率上限",
+                  subtitle: controller.powerSaveMode.value
+                      ? "省电模式下已强制 60 帧"
+                      : "高刷新率屏幕限制 60 帧可明显降低发热",
+                  value: controller.danmuMaxFps.value,
+                  valueMap: const {0: "跟随屏幕", 60: "60 帧"},
+                  onChanged: controller.setDanmuMaxFps,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Padding(
+          padding: AppStyle.edgeInsetsA12.copyWith(top: 24),
+          child: Text(
+            "重点动态",
+            style: Get.textTheme.titleSmall,
+          ),
+        ),
+        SettingsCard(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
               Obx(
                 () => SettingsSwitch(
                   title: "重点动态",
@@ -306,7 +435,20 @@ class DanmuSettingsView extends GetView<AppSettingsController> {
                   onChanged: controller.setLiveEventFlowLimit,
                 ),
               ),
-              AppStyle.divider,
+            ],
+          ),
+        ),
+        Padding(
+          padding: AppStyle.edgeInsetsA12.copyWith(top: 24),
+          child: Text(
+            "过滤与延迟",
+            style: Get.textTheme.titleSmall,
+          ),
+        ),
+        SettingsCard(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
               Obx(
                 () => SettingsSwitch(
                   title: "重复弹幕过滤",
@@ -371,82 +513,6 @@ class DanmuSettingsView extends GetView<AppSettingsController> {
                   ],
                 );
               }),
-              AppStyle.divider,
-              Obx(
-                () => SettingsNumber(
-                  title: "不透明度",
-                  value: (controller.danmuOpacity.value * 100).toInt(),
-                  min: 10,
-                  max: 100,
-                  step: 10,
-                  unit: "%",
-                  onChanged: (e) {
-                    controller.setDanmuOpacity(e / 100.0);
-                    updatePreviewOption(opacity: e / 100.0);
-                  },
-                ),
-              ),
-              AppStyle.divider,
-              Obx(
-                () => SettingsNumber(
-                  title: "字体大小",
-                  value: controller.danmuSize.value.toInt(),
-                  min: 8,
-                  max: 180,
-                  onChanged: (e) {
-                    final nextFontSize = e.toDouble();
-                    controller.setDanmuSize(nextFontSize);
-                    final nextMaxLines =
-                        controller.estimateDanmuMaxVisibleLineCount(
-                      viewportHeight: effectiveViewportHeight,
-                      fontSize: nextFontSize,
-                    );
-                    if (controller.danmuLineCount.value > nextMaxLines) {
-                      controller.setDanmuLineCount(nextMaxLines);
-                    }
-                    updatePreviewOption(fontSize: nextFontSize);
-                  },
-                ),
-              ),
-              AppStyle.divider,
-              Obx(
-                () => SettingsNumber(
-                  title: "字体粗细",
-                  value: controller.danmuFontWeight.value,
-                  min: 1,
-                  max: 9,
-                  step: 1,
-                  displayValue: [
-                    "极细",
-                    "很细",
-                    "细",
-                    "正常",
-                    "小粗",
-                    "偏粗",
-                    "粗",
-                    "很粗",
-                    "极粗",
-                  ][controller.danmuFontWeight.value - 1],
-                  onChanged: (e) {
-                    controller.setDanmuFontWeight(e);
-                    updatePreviewOption(fontWeight: e);
-                  },
-                ),
-              ),
-              AppStyle.divider,
-              Obx(
-                () => SettingsNumber(
-                  title: "滚动速度",
-                  subtitle: "弹幕持续时间（秒），越小速度越快",
-                  value: controller.danmuSpeed.value.toInt(),
-                  min: 1,
-                  max: 30,
-                  onChanged: (e) {
-                    controller.setDanmuSpeed(e.toDouble());
-                    updatePreviewOption(duration: e);
-                  },
-                ),
-              ),
               AppStyle.divider,
               Obx(
                 () => SettingsNumber(

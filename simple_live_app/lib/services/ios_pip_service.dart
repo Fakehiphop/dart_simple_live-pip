@@ -1,119 +1,123 @@
 import 'dart:async';
-import 'dart:io';
 
-import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import 'package:flutter/services.dart';
-import 'package:flutter/widgets.dart' show AppLifecycleState, WidgetsBinding;
 import 'package:media_kit/media_kit.dart';
+import 'package:simple_live_app/app/log.dart';
 
-/// iOS 画中画（原生实现见 `ios/Runner/PipPlugin.swift`，移植自 PiliPlus）。
+/// iOS 系统画中画的 Dart 侧入口。
 ///
-/// mpv 把帧渲染进 media_kit_video 私有的 `FlutterTexture`，原生侧钩住引擎的
-/// 纹理注册表取帧，再喂给 `AVSampleBufferDisplayLayer`（iOS 15+）。
+/// 对应原生 `ios/Runner/PipPlugin.swift`。播放内核是 media_kit（libmpv），
+/// 视频经 `FlutterTexture` 暴露，原生侧 hook 纹理注册表取帧后喂给
+/// `AVSampleBufferDisplayLayer`，再挂到
+/// `AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer:)`。
 abstract final class IosPipService {
-  static const _channel = MethodChannel('simple_live/ios_pip');
+  static const MethodChannel _channel = MethodChannel('simple_live/ios_pip');
 
-  static bool isAvailable = false;
+  static final _events = StreamController<IosPipEvent>.broadcast();
+  static bool _handlerInstalled = false;
 
-  /// 画中画窗口是否正在（或即将）显示。
-  static bool isActive = false;
-
-  static bool _autoEnter = false;
-
-  /// 原生侧是否需要播放状态更新。
-  static bool get needsUpdate => isActive || _autoEnter;
-
-  /// 播放状态回调，由播放控制器注册。
-  static Future<void> Function(bool playing)? onSetPlaying;
-  static void Function(Duration position)? onSkip;
-  static void Function(bool active, bool closedInBackground)? onStateChanged;
-
-  /// 进入画中画失败时回调（仅在前台提示，后台失败静默）。
-  static void Function(String message)? onError;
-
-  static Future<void> init() async {
-    if (!Platform.isIOS) {
-      return;
+  /// 画中画事件流。
+  ///
+  /// 原生侧通过同一个 MethodChannel 反向调用推送事件：
+  /// `onStateChanged{active, closed?, error?}` / `setPlaying` / `skip`。
+  static Stream<IosPipEvent> get events {
+    if (!_handlerInstalled) {
+      _handlerInstalled = true;
+      _channel.setMethodCallHandler((call) async {
+        switch (call.method) {
+          case 'onStateChanged':
+            final args = (call.arguments as Map?)?.cast<String, Object?>() ?? {};
+            final active = args['active'] == true;
+            final closed = args['closed'] == true;
+            final error = args['error'] as String?;
+            if (error != null) {
+              _events.add(IosPipEvent.failed);
+            } else if (active) {
+              _events.add(IosPipEvent.entered);
+            } else if (closed) {
+              _events.add(IosPipEvent.closed);
+            } else {
+              _events.add(IosPipEvent.exited);
+            }
+          case 'setPlaying':
+            _events.add(
+              (call.arguments as bool?) == true
+                  ? IosPipEvent.resumed
+                  : IosPipEvent.paused,
+            );
+          case 'skip':
+            // 直播不可跳转，原生侧已忽略，这里只记录。
+            Log.d("iOS 画中画忽略跳转请求: ${call.arguments}");
+          default:
+            Log.d("iOS 画中画未知事件: ${call.method}");
+        }
+      });
     }
-    _channel.setMethodCallHandler(_onMethodCall);
+    return _events.stream;
+  }
+
+  /// 当前设备是否支持系统画中画（iOS 15+）。
+  static Future<bool> get isSupported async {
     try {
-      isAvailable = await _channel.invokeMethod<bool>('isAvailable') ?? false;
+      return await _channel.invokeMethod<bool>('isAvailable') ?? false;
     } catch (e) {
-      if (kDebugMode) debugPrint('IosPipService init: $e');
+      Log.d("iOS 画中画能力探测失败: $e");
+      return false;
     }
   }
 
-  static Future<void> _onMethodCall(MethodCall call) async {
-    switch (call.method) {
-      case 'onStateChanged':
-        final args = call.arguments as Map;
-        final active = args['active'] == true;
-        isActive = active;
-        final error = args['error'];
-        if (error != null && kDebugMode) {
-          debugPrint('IosPipService: $error');
-        }
-        final isResumed =
-            WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
-        onStateChanged?.call(active, args['closed'] == true && !isResumed);
-        if (error != null && isResumed) {
-          onError?.call("画中画启动失败");
-        }
-        break;
-      case 'setPlaying':
-        onSetPlaying?.call(call.arguments as bool);
-        break;
-      case 'skip':
-        final delta = Duration(milliseconds: call.arguments as int);
-        onSkip?.call(delta);
-        break;
-    }
-  }
-
-  /// 进入画中画；[autoEnter] 为 true 时改为"退到后台自动进入"。
-  static void enter(
-    int textureId, {
-    required int? width,
-    required int? height,
-    required bool autoEnter,
+  /// 进入画中画。
+  ///
+  /// [textureId] 是 media_kit 渲染视频所用的 Flutter 纹理 id，原生侧据此
+  /// 取帧。[width] / [height] 为视频的显示宽高比来源。[autoEnter] 为 true
+  /// 时表示退后台自动进入，由系统在 App 切入后台时触发。
+  static Future<bool> enter({
+    required int textureId,
+    required double width,
+    required double height,
     required Map<String, Object> state,
-  }) {
-    if (!Platform.isIOS) {
-      return;
-    }
-    if (autoEnter) _autoEnter = true;
-    final arguments = <String, Object>{'textureId': textureId};
-    if (width != null && width > 0) arguments['width'] = width;
-    if (height != null && height > 0) arguments['height'] = height;
-    arguments['autoEnter'] = autoEnter;
-    arguments.addAll(state);
-    _channel.invokeMethod('enter', arguments);
-  }
-
-  static void update(Map<String, Object> state) {
-    if (!Platform.isIOS || !needsUpdate) {
-      return;
-    }
-    _channel.invokeMethod('update', state);
-  }
-
-  static void disableAutoEnter() {
-    if (!Platform.isIOS) {
-      return;
-    }
-    if (_autoEnter) {
-      _autoEnter = false;
-      _channel.invokeMethod('disableAutoEnter');
+    bool autoEnter = false,
+  }) async {
+    try {
+      await _channel.invokeMethod<void>('enter', {
+        'textureId': textureId,
+        'width': width,
+        'height': height,
+        'autoEnter': autoEnter,
+        ...state,
+      });
+      return true;
+    } catch (e) {
+      Log.d("进入 iOS 画中画失败: $e");
+      return false;
     }
   }
 
-  static void dispose() {
-    if (!Platform.isIOS) {
-      return;
+  /// 推送播放状态变化。
+  static Future<void> update(Map<String, Object> state) async {
+    try {
+      await _channel.invokeMethod<void>('update', state);
+    } catch (e) {
+      Log.d("更新 iOS 画中画状态失败: $e");
     }
-    _autoEnter = false;
-    isActive = false;
-    _channel.invokeMethod('dispose');
+  }
+
+  /// 取消退后台自动进入（保留会话）。
+  static Future<void> disableAutoEnter() async {
+    try {
+      await _channel.invokeMethod<void>('disableAutoEnter');
+    } catch (e) {
+      Log.d("取消 iOS 自动画中画失败: $e");
+    }
+  }
+
+  /// 结束画中画会话。
+  static Future<void> dispose() async {
+    try {
+      await _channel.invokeMethod<void>('dispose');
+    } catch (e) {
+      Log.d("结束 iOS 画中画失败: $e");
+    }
   }
 
   /// 把 media_kit 的播放状态打包成原生侧需要的字段（毫秒）。
@@ -132,4 +136,31 @@ abstract final class IosPipService {
       'isLive': isLive ?? !(state.duration.inMilliseconds > 0),
     };
   }
+}
+
+/// 画中画事件。
+///
+/// 原生侧只会上报四种：`onStateChanged{active:true}` → [entered]；
+/// `onStateChanged{active:false, closed:false}` → [exited]（用户点恢复按钮）；
+/// `onStateChanged{active:false, closed:true}` → [closed]（用户点关闭按钮）；
+/// `onStateChanged{error}` → [failed]。另有 `setPlaying` / `skip` 两个
+/// 播放控制回调。
+enum IosPipEvent {
+  /// 已进入画中画
+  entered,
+
+  /// 已退出画中画，界面回到 App 内联显示
+  exited,
+
+  /// 小窗被用户关闭
+  closed,
+
+  /// 小窗上点击了播放
+  resumed,
+
+  /// 小窗上点击了暂停
+  paused,
+
+  /// 启动或运行失败
+  failed,
 }
