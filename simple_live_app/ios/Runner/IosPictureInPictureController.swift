@@ -226,7 +226,7 @@ final class IosPictureInPictureController: NSObject,
               let videoView = videoView else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        rootView.bringSubview(toFront: videoView)
+        rootView.bringSubviewToFront(videoView)
         videoView.frame = rect
         CATransaction.commit()
         NSLog("SimpleLive PiP: mirror exposed at video rect (inline visibility probe)")
