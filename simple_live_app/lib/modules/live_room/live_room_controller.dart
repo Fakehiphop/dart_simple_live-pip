@@ -3953,10 +3953,10 @@ ${errorStackTrace ?? ""}''');
     } else if (state == AppLifecycleState.inactive) {
       Log.d("应用短暂失焦:$state");
       unawaited(syncAutoPipOnLeave());
-      // iOS：趁仍在前台完成退后台画中画的最后准备。
-      // 早武装（建会话 + 系统自动启动开关）已随开播完成，这里幂等确认
-      // 一次，并只补做软件渲染切换这类重操作。
-      // 失焦也可能来自控制中心等误触发，回前台时解除武装即可。
+      // iOS：趁仍在前台确认退后台画中画就绪（温热管线 + 系统自动启动开关）。
+      // 早武装已随开播完成，这里幂等确认一次并同步最新播放状态，
+      // v3 无渲染器切换。失焦也可能来自控制中心等误触发，
+      // 回前台时解除武装即可。
       if (Platform.isIOS &&
           AppSettingsController.instance.autoPipOnExit.value &&
           liveStatus.value &&
@@ -4024,7 +4024,7 @@ ${errorStackTrace ?? ""}''');
   bool _iosAutoPipFallbackStartScheduled = false;
 
   /// 兜底：系统自动启动未发生时（武装时层内尚未就绪等），稍后显式进入。
-  /// 显式进入也失败则解除武装，停止后台无谓的软件渲染帧拷贝。
+  /// 显式进入也失败则解除武装，停止后台无谓的保温帧拷贝。
   void _scheduleIosAutoPipFallbackStart() {
     if (_iosAutoPipFallbackStartScheduled) {
       return;

@@ -1641,10 +1641,10 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
   bool get iosPipAutoStartArmed => _iosPipAutoStartArmed;
   bool _iosPipAutoStartArmed = false;
 
-  /// iOS 画中画早武装（SwiftPeek 的成功路径）：开播即建立会话并打开
-  /// 系统自动启动开关（canStartPictureInPictureAutomaticallyFromInline）。
-  /// 自动启动的判定发生在退后台瞬间，武装不能压在那几百毫秒里——
-  /// 软件渲染切换等重操作留给 prepareIosPipForResign（inactive 阶段）。
+  /// iOS 画中画早武装：开播即建立会话并打开系统自动启动开关
+  /// （canStartPictureInPictureAutomaticallyFromInline）。自动启动的判定
+  /// 发生在退后台瞬间，武装不能压在那几百毫秒里。
+  /// v3：帧管线全程温热（未进小窗 4fps 保温），无重操作，随建随武装。
   /// 幂等：会话已就绪时重复调用是空操作。
   Future<void> armIosPipForBackground() async {
     if (!Platform.isIOS || _playerClosing) {
@@ -1663,9 +1663,8 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
         'iOS PiP: 早武装${_iosPipAutoStartArmed ? '完成（系统自动启动已开启）' : '失败'}');
   }
 
-  /// 退后台收尾（应用 inactive 阶段调用）：切换软件渲染 + 同步播放状态。
-  /// 这是早武装后唯一剩下的重操作，在仍有几百毫秒的前台窗口内完成；
-  /// 若未能完成，会话层内的持续镜像帧也足够系统完成自动启动判定。
+  /// 退后台收尾（应用 inactive 阶段调用）。v3 无需切换软件渲染——
+  /// GPU 渲染管线全程恒定，帧镜像持续喂养；这里只同步一次最新状态。
   Future<void> prepareIosPipForResign() async {
     if (!Platform.isIOS || _playerClosing || !_iosPipAutoStartArmed) {
       return;
@@ -1678,10 +1677,10 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
       return;
     }
     final ok = await pip.prepareForBackground();
-    Log.d('iOS PiP: 退后台收尾${ok ? '完成（软件渲染已切换）' : '失败（层内帧仍持续喂养）'}');
+    Log.d('iOS PiP: 退后台收尾${ok ? '完成（状态已同步，管线温热）' : '失败'}');
   }
 
-  /// 解除武装（回前台且画中画未启动）：恢复 GL 渲染，停止帧拷贝开销。
+  /// 解除武装（回前台）：v3 无渲染器恢复步骤，仅在必要时释放会话。
   Future<void> disarmIosPipForBackground() async {
     if (!Platform.isIOS || !_iosPipAutoStartArmed) {
       return;
