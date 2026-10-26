@@ -4038,6 +4038,10 @@ ${errorStackTrace ?? ""}''');
 
   bool _iosAutoPipFallbackStartScheduled = false;
 
+  // v9：inactive 显式启动的去抖定时器（0.25s），短暂失焦（控制中心等）
+  // 在窗口内回前台时被取消，不弹小窗。
+  Timer? _iosInactivePipTimer;
+
   /// 兜底：系统自动启动未发生时稍后观察记录。v5 不再显式进入——
   /// 后台显式 startPictureInPicture 被系统禁止（场景态 Background，
   /// AVKitErrorDomain -1001），合法路径只剩系统标志与 inactive 阶段的
