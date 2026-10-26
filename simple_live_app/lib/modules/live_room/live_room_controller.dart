@@ -3964,6 +3964,9 @@ ${errorStackTrace ?? ""}''');
           player.state.playing) {
         unawaited(armIosPipForBackground());
         unawaited(prepareIosPipForResign());
+        // v4：inactive 阶段即显式启动（重活已就绪，只余一行 start），
+        // 系统标志拉起与后台双兜底之外的最可靠一路。
+        unawaited(enterIosPipForBackground());
       }
     }
   }

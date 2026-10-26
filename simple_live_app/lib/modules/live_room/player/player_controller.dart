@@ -1680,6 +1680,24 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     Log.d('iOS PiP: 退后台收尾${ok ? '完成（状态已同步，管线温热）' : '失败'}');
   }
 
+  /// inactive 阶段的显式启动（v4 核心兜底）：早武装后所有重活都已在前台
+  /// 完成，inactive 时刻系统只余一行 start 调用；配合退后台 1 秒原生
+  /// 兜底与后台 2.5 秒 Dart 兜底，共三路拉起保险。
+  Future<void> enterIosPipForBackground() async {
+    if (!Platform.isIOS || _playerClosing || !_iosPipAutoStartArmed) {
+      return;
+    }
+    if (iosPipActiveOrEntering) {
+      return;
+    }
+    final pip = _iosPip;
+    if (pip == null) {
+      return;
+    }
+    final issued = await pip.requestAutoEnter();
+    Log.d('iOS PiP: inactive 显式启动${issued ? '已发出' : '未发出（会话未就绪或已在进行）'}');
+  }
+
   /// 解除武装（回前台）：v3 无渲染器恢复步骤，仅在必要时释放会话。
   Future<void> disarmIosPipForBackground() async {
     if (!Platform.isIOS || !_iosPipAutoStartArmed) {

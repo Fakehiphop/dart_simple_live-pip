@@ -3,19 +3,24 @@ import Accelerate
 import Flutter
 import UIKit
 
-// v3：放弃 Kazumi PR #2646 的"退后台前切换软件渲染"前置步骤，改走
-// PiliPlus（#3162，与本项目同构：media-kit 纹理帧 → AVSampleBufferDisplayLayer）
-// 已验证的全程温热管线方案，同时保留 SwiftPeek（GPL-3.0）的帧泵纪律：
-//   1. 全程不切换渲染器、不挂起视频轨：纹理 ID 恒定，帧镜像持续喂养
-//      （未进小窗 4fps 低速保温，进小窗/进入中 30fps 全速）。PiliPlus 用
-//      同构栈验证了这是后台自动画中画成立的充分条件；切换软件渲染会更换
-//      纹理、断开管线，是进小窗 1 秒卡顿、后台拉不起与 -1001 残留的根源。
-//   2. 回前台（didBecomeActive/didActivate）且画中画活跃时自动 stop
-//      （enteredBackground 守卫，PiliPlus 同款），并根除残留会话导致的
-//      AVKitErrorDomain -1001。
-//   3. 退后台 2 秒系统仍未拉起则原生兜底显式 startPictureInPicture 一次
-//      （Dart 侧另有 2.5 秒兜底，两条路径都有完整日志用于定案）。
-//   4. 时基纪律：PTS 来自 controlTimebase，不与
+// v4（混合路线：SwiftPeek/PiliPlus 温热管线 + Kazumi 软件渲染后台续航）：
+//   1. 全程不切换渲染器的温热帧管线只用于"武装"：会话与首帧在前台就绪
+//      （未进小窗 4fps 保温、进小窗/进入中 30fps 全速），ARM 后置
+//      canStartPictureInPictureAutomaticallyFromInline。
+//   2. 镜像层常态离屏（窗口左上角 1px）：v3 实证插在 FlutterView 内的
+//      子视图位于 Flutter 绘制内容之上，以 4fps 镜像"顶替"真实直播
+//      ——房间卡顿与菜单被"直播挡住"皆源于此。PiP 消费 AVSampleBuffer
+//      只依赖 layer 本身，不依赖视图正常展示。
+//   3. media_kit 后台 GPU 渲染停摆（v3 实证：小窗冻结在最后一帧；v1
+//      软件渲染路径实证后台可续帧）→ PiP 启动（WillStart）时切软件
+//      渲染，数完成后小窗持续 30fps——前台零卡顿与后台活画面兼得。
+//   4. 自动启动三路保险：a) 系统标志（退后台探针：镜像层临时摆回视频
+//      区域最顶层，回前台收回）；b) inactive 阶段显式 start（Dart 新
+//      通道 enterAuto，此时重活已全部就绪仅余一行调用）；c) 退后台 1 秒
+//      原生显式 start 兜底。全程日志可定案。
+//   5. 回前台且 PiP 活跃即自动 stop（除启动过渡回声），小窗不残留，
+//      同时根除残留会话导致的 AVKitErrorDomain -1001。
+//   6. 时基纪律：PTS 来自 controlTimebase，不与
 //      kCMSampleAttachmentKey_DisplayImmediately 混用（30fps 采样、
 //      960px 长边上限、vImage CPU 缩放、单槽 latest、背压）。
 @available(iOS 15.0, *)
@@ -44,6 +49,10 @@ final class IosPictureInPictureController: NSObject,
     private var suspendOnStart = false
     private var restoring = false
     private var textureId: Int64?
+    private var pendingRenderHandle: Int64?
+    private var softwareSwitchDone = false
+    private var lastSourceRect: CGRect?
+    private var lastWillStartAt: Double = 0
     private var playing = false
     private var duration: Double = 0
     private var timebase: CMTimebase?
@@ -92,6 +101,8 @@ final class IosPictureInPictureController: NSObject,
                 result(nil)
             case "enter":
                 self.enter(result)
+            case "enterAuto":
+                self.enterAuto(result)
             case "setAutoStartEnabled":
                 // 退后台自动启动的唯一正规机制（Apple 文档契约）：
                 // 后台时 startPictureInPicture() 不保证可用，须由系统在
@@ -165,6 +176,10 @@ final class IosPictureInPictureController: NSObject,
         guard let pip = controller else { return }
         enteredBackground = true
         stopRequested = false
+        // 内联可见性探针（v4）：系统自动拉起需要"inline 内容源可见"的
+        // 判定条件。退后台瞬间把镜像层摆回视频区域最顶层，给系统判定
+        // 的机会；成功与否日志见下，探针在回前台时收回。
+        mirrorExpose()
         NSLog("SimpleLive PiP: didEnterBackground, autoStart=%@ possible=%@ active=%@ playing=%@ hasFrame=%@ src=%ld enq=%ld",
               pip.canStartPictureInPictureAutomaticallyFromInline ? "true" : "false",
               pip.isPictureInPicturePossible ? "true" : "false",
@@ -172,32 +187,84 @@ final class IosPictureInPictureController: NSObject,
               playing ? "true" : "false",
               hasEnqueuedFrame ? "true" : "false",
               sourceFrames, enqueuedFrames)
-        // 系统应在退后台瞬间自行拉起（canStart…FromInline + 温热帧管线）。
-        // 给系统 2 秒；仍未拉起则原生兜底显式进入一次。
+        // 层内恒有新鲜帧 + 自动启动开关已开，系统应即拉起；1 秒仍未拉起
+        // 则显式 start 兜底（inactive 阶段重活已全部完成，仅余这一步）。
         backgroundAutoStartCheck?.cancel()
         guard autoStartArmed, !pip.isPictureInPictureActive, playing else { return }
         let check = DispatchWorkItem { [weak self] in
             guard let self = self, let pip = self.controller else { return }
             guard self.autoStartArmed, !pip.isPictureInPictureActive, !self.stopRequested else { return }
-            NSLog("SimpleLive PiP: system auto start did not happen, fallback start issued (auto#fallback)")
+            NSLog("SimpleLive PiP: system auto start did not happen, fallback start issued (auto#background)")
             pip.startPictureInPicture()
         }
         backgroundAutoStartCheck = check
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: check)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: check)
     }
 
     private func handleDidBecomeActive() {
-        guard enteredBackground else { return }
-        enteredBackground = false
+        // 探针结束：镜像层收回离屏，取消后台兜底定时器。
+        mirrorConceal()
         backgroundAutoStartCheck?.cancel()
         backgroundAutoStartCheck = nil
+        enteredBackground = false
         guard let pip = controller else { return }
-        // 回 app 自动关闭小窗（PiliPlus 同款），并顺带根除
-        // "上一会话系统侧仍活跃"导致的 AVKitErrorDomain -1001。
-        guard pip.isPictureInPictureActive else { return }
-        NSLog("SimpleLive PiP: became active, stopPictureInPicture issued (auto stop on return)")
-        stopRequested = true
-        pip.stopPictureInPicture()
+        // 回 app 自动关闭小窗（PiP 关闭即回归行内，小窗不再残留），
+        // 并根治"上一会话系统侧仍活跃"导致的 AVKitErrorDomain -1001。
+        // 启动过渡期（1.5s 内）的 didActivate 是启动自身的回声，跳过。
+        let inStartTransition = lastWillStartAt > 0
+            && CACurrentMediaTime() - lastWillStartAt < 1.5
+        if pip.isPictureInPictureActive && !inStartTransition {
+            NSLog("SimpleLive PiP: became active, stopPictureInPicture issued (auto stop on return)")
+            stopRequested = true
+            pip.stopPictureInPicture()
+        }
+    }
+
+    /// 探针：把镜像层摆回视频区域最顶层（可见）。
+    private func mirrorExpose() {
+        guard let rect = lastSourceRect, let rootView = videoView?.superview,
+              let videoView = videoView else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        rootView.bringSubview(toFront: videoView)
+        videoView.frame = rect
+        CATransaction.commit()
+        NSLog("SimpleLive PiP: mirror exposed at video rect (inline visibility probe)")
+    }
+
+    /// 探针结束：镜像层收回窗口左上角 1px 离屏。
+    private func mirrorConceal() {
+        guard let videoView = videoView else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        videoView.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+        CATransaction.commit()
+    }
+
+    /// PiP 启动即切软件渲染：media_kit 的 GPU 渲染后台停摆（CADisplayLink
+    /// 类驱动随生命周期暂停），此前 v1 的软件渲染路径实证可在后台持续
+    /// 出帧。小窗已启动后切换（数百毫秒），期间小窗保持旧帧，此后持续
+    /// 有 30fps 新鲜帧——不影响前台行内画面，也不产生进入时 1 秒卡顿。
+    private func switchToSoftwareRenderingForPip() {
+        guard !softwareSwitchDone, let handle = pendingRenderHandle,
+              let useSoftwareRendering = useSoftwareRendering else {
+            if !softwareSwitchDone {
+                NSLog("SimpleLive PiP: post-start software switch skipped (no handle/renderer)")
+                softwareSwitchDone = true
+            }
+            return
+        }
+        softwareSwitchDone = true
+        let generation = sessionGeneration
+        useSoftwareRendering(handle) { [weak self] ready in
+            guard let self = self, self.sessionGeneration == generation else { return }
+            NSLog("SimpleLive PiP: post-start software switch %@",
+                  ready ? "ready" : "failed (PiP may hold last frame)")
+            if ready {
+                // 通知 Dart 立即把新纹理 ID 同步回来，缩短小窗静止间隙。
+                self.channel.invokeMethod("onSoftwareSwitchReady", arguments: nil)
+            }
+        }
     }
 
     private func prepareSource(_ args: [String: Any]) -> Bool {
@@ -217,6 +284,14 @@ final class IosPictureInPictureController: NSObject,
             view.displayLayer.controlTimebase = timebase
             // 压到底层：镜像层在应用内不可见，AVKit 只是消费这个内容源。
             rootView.insertSubview(view, at: 0)
+            // v4：镜像层常态离屏（窗口左上角 1px、裁剪）。v3 实证插在
+            // FlutterView 内的子视图位于 Flutter 绘制内容之上，前台会以
+            // 4fps 镜像"顶替"真实直播——房间卡顿与菜单被"直播挡住"皆源于
+            // 此；且 media_kit 后台 GPU 渲染停摆（小窗冻结在最后一帧），
+            // 故在 PiP 启动后再切软件渲染（WillStart 回调）让小窗画面
+            // 活起来（回到 Kazumi/v1 实证有效的软件渲染路径）。
+            view.clipsToBounds = true
+            view.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
             videoView = view
             let content = AVPictureInPictureController.ContentSource(
                 sampleBufferDisplayLayer: view.displayLayer, playbackDelegate: self)
@@ -227,6 +302,10 @@ final class IosPictureInPictureController: NSObject,
             NSLog("SimpleLive PiP: session created")
         }
         textureId = id.int64Value
+        if let handle = args["handle"] as? NSNumber {
+            pendingRenderHandle = handle.int64Value
+        }
+        softwareSwitchDone = false
         updatePlaybackState(args)
         if let buffer = copyPixelBuffer?(id.int64Value) {
             onVideoFrame(buffer, textureId: id.int64Value)
@@ -245,14 +324,13 @@ final class IosPictureInPictureController: NSObject,
             CMTimebaseSetTime(timebase, time: CMTime(seconds: position, preferredTimescale: 1000))
             CMTimebaseSetRate(timebase, rate: playing ? rate : 0)
         }
+        // v4：镜像层常态离屏，不随 sourceRect 移动；仅在退后台探针时
+        // 临时摆回视频区域（mirrorExpose）。这里缓存最近一次区域。
         if let rect = args["sourceRect"] as? [String: NSNumber] {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            videoView?.frame = CGRect(x: rect["left"]?.doubleValue ?? 0,
-                                      y: rect["top"]?.doubleValue ?? 0,
-                                      width: rect["width"]?.doubleValue ?? 0,
-                                      height: rect["height"]?.doubleValue ?? 0)
-            CATransaction.commit()
+            lastSourceRect = CGRect(x: rect["left"]?.doubleValue ?? 0,
+                                    y: rect["top"]?.doubleValue ?? 0,
+                                    width: rect["width"]?.doubleValue ?? 0,
+                                    height: rect["height"]?.doubleValue ?? 0)
         }
         controller?.requiresLinearPlayback = duration <= 0
         controller?.invalidatePlaybackState()
@@ -318,8 +396,26 @@ final class IosPictureInPictureController: NSObject,
         DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: timeout)
     }
 
-    private var hasDisplayableFrame: Bool {
-        guard hasEnqueuedFrame, frameSize.width > 0, frameSize.height > 0,
+    /// inactive 阶段的显式启动（v4 核心兜底）：早武装后所有重活都已在前台
+    /// 完成（会话、首帧、possible），inactive 时刻只余 start 一行调用。
+    /// 后台 GPU 渲染随生命周期停摆无妨——启动后的 WillStart 回调会切
+    /// 软件渲染续命。不开 suspend（不属于"点按钮进小窗"路径）。
+    private func enterAuto(_ result: @escaping FlutterResult) {
+        guard let pip = controller else {
+            NSLog("SimpleLive PiP: enterAuto ignored, no session")
+            result(false); return
+        }
+        guard !pip.isPictureInPictureActive, entryResult == nil,
+              hasEnqueuedFrame, suspendOnStart == false else {
+            result(false); return
+        }
+        NSLog("SimpleLive PiP: startPictureInPicture issued (auto@inactive), possible=%@",
+              pip.isPictureInPicturePossible ? "true" : "false")
+        pip.startPictureInPicture()
+        result(true)
+    }
+
+    private var hasDisplayableFrame: Bool {        guard hasEnqueuedFrame, frameSize.width > 0, frameSize.height > 0,
               let layer = videoView?.displayLayer, layer.status == .rendering else { return false }
         if #available(iOS 17.4, *) { return layer.isReadyForDisplay }
         return true
@@ -379,6 +475,10 @@ final class IosPictureInPictureController: NSObject,
         controller?.delegate = nil
         controller = nil
         textureId = nil
+        pendingRenderHandle = nil
+        softwareSwitchDone = false
+        lastSourceRect = nil
+        lastWillStartAt = 0
         videoView?.displayLayer.flushAndRemoveImage()
         videoView?.removeFromSuperview()
         videoView = nil
@@ -530,8 +630,12 @@ final class IosPictureInPictureController: NSObject,
         // 自动启动路径的过渡保护：立即通知 Dart 进入 PiP 模式
         // （同步定时器提前运行，绘制状态不再漂移）。
         activeFeed = true
-        NSLog("SimpleLive PiP: will start (auto#@%@)", suspendOnStart ? "manual" : "system")
+        lastWillStartAt = CACurrentMediaTime()
+        NSLog("SimpleLive PiP: will start (%@)",
+              suspendOnStart ? "manual + suspend" : "auto")
         channel.invokeMethod("onModeChanged", arguments: ["isInPipMode": true])
+        // 启动即切软件渲染，让小窗在后台持续出帧（GPU 路线已实证停摆）。
+        switchToSoftwareRenderingForPip()
     }
 
     func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {

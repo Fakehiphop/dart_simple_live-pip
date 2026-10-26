@@ -127,8 +127,15 @@ class IosPipController {
       if (!await _bridge.acquireNative(this) || !_ownsPage) {
         return false;
       }
+      // handle 供原生在 PiP 启动后切换软件渲染用。
+      final handle = await playerHandle();
+      if (!_ownsPage) return false;
+      final attachArgs = <String, Object>{
+        ...state.toArguments(),
+        if (handle != null) 'handle': handle,
+      };
       final attached =
-          await _channel.invokeMethod<bool>('attach', state.toArguments());
+          await _channel.invokeMethod<bool>('attach', attachArgs);
       if (!_ownsPage || attached != true) return false;
       final armed = await _channel.invokeMethod<bool>(
         'setAutoStartEnabled',
@@ -162,6 +169,20 @@ class IosPipController {
       return false;
     } on MissingPluginException {
       return true;
+    }
+  }
+
+  /// inactive 阶段的显式启动（v4）：早武装后重活已就绪，inactive 时刻
+  /// 只余一行 start 调用。返回是否发出（会话未就绪/已在活动时为 false）。
+  Future<bool> requestAutoEnter() async {
+    if (!_ownsPage || _active || _entry.isRunning) return false;
+    try {
+      return await _channel.invokeMethod<bool>('enterAuto') ?? false;
+    } on PlatformException catch (error) {
+      Log.w('iOS PiP: 显式启动失败: $error');
+      return false;
+    } on MissingPluginException {
+      return false;
     }
   }
 
@@ -222,13 +243,19 @@ class IosPipController {
             : false;
       case 'onModeChanged':
         if (!_ownsPage) return null;
-        if (args['isInPipMode'] == true && !keepPlaybackInBackground) {
-          return null;
-        }
+        // 原生仅在真实 PiP 启动时发 isInPipMode=true；自动启动路径
+        // （_inactive 显式 start/系统标志）同样必须接住，否则 Dart 状态
+        // 失同步、新纹理 ID 无法回传。不要用 keepPlaybackInBackground
+        // 门拦——自动路径此时 _active/_entry/_arm 均可能为空。
         _active = args['isInPipMode'] == true;
         onModeChanged(_active, args['restored'] == true);
       case 'onRestore':
         return _ownsPage && canRestore();
+      case 'onSoftwareSwitchReady':
+        // v4：小窗启动后的软件渲染切换完成，新纹理 ID 已产生，
+        // 立即同步状态（否则要等 1 秒周期的定时器；synchronize 自带
+        // keepPlaybackInBackground 与 ownsNative 守卫）。
+        await synchronize();
       case 'onAction':
         if (!keepPlaybackInBackground) return null;
         switch (args['action']) {
