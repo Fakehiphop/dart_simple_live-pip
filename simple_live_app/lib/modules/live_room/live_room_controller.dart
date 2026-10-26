@@ -3921,6 +3921,8 @@ ${errorStackTrace ?? ""}''');
       isBackground = false;
       _resumePlaybackForWindowsMinimize();
       if (Platform.isIOS) {
+        // v9：取消 inactive 启动去抖——短暂失焦回前台不弹小窗。
+        _iosInactivePipTimer?.cancel();
         // v5：会话常驻温热，回前台不停小窗以外的任何东西，
         // 不解除武装也不释放会话（disarm 已为空操作），保证下一次
         // 退后台系统标志直接拉起。
@@ -3966,10 +3968,16 @@ ${errorStackTrace ?? ""}''');
           player.state.playing) {
         unawaited(armIosPipForBackground());
         unawaited(prepareIosPipForResign());
-        // v5：不在 inactive 显式 start——失焦也会来自控制中心等
-        // （inactive ≠ 退后台），显式启动会把小窗弹到不想看到的场景。
-        // 自动拉起交给常驻温热会话上的系统标志（日志实证系统在退后台
-        // 过渡的精确时机自行拉起，首轮成功同款路径）。
+        // v9：恢复 inactive 显式启动（v4 实证首次退后台唯一可靠路径；
+        // 系统自动启动对全新远程对象的首次退后台始终不发起，v7/v8 预
+        // 绑定与后台补推均无效）。0.25s 去抖：真正的退后台 inactive
+        // 会持续（紧接着 paused），控制中心下拉等短暂失焦会在窗口内
+        // 回到 active 而被原生 applicationState 闸门拒绝。
+        _iosInactivePipTimer?.cancel();
+        _iosInactivePipTimer = Timer(const Duration(milliseconds: 250), () {
+          if (isBackground) return;
+          unawaited(enterIosPipForBackground());
+        });
       }
     }
   }

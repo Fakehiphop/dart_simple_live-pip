@@ -451,13 +451,20 @@ final class IosPictureInPictureController: NSObject,
         DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: timeout)
     }
 
-    /// inactive 阶段的显式启动（v4 核心兜底）：早武装后所有重活都已在前台
-    /// 完成（会话、首帧、possible），inactive 时刻只余 start 一行调用。
-    /// 后台 GPU 渲染随生命周期停摆无妨——启动后的 WillStart 回调会切
-    /// 软件渲染续命。不开 suspend（不属于"点按钮进小窗"路径）。
+    /// inactive 阶段的显式启动（v9 恢复 v4 通道）：系统自动启动对全新
+    /// Pegasus 远程对象的首次退后台始终不发起（v7/v8 两轮真机日志实证，
+    /// 预绑定与后台补推均无效），而 v4 的 inactive 显式 start 实证首次
+    /// 即成功（彼时场景仍在前台，合法；后台显式 start 才是 -1001）。
+    /// 防误触发：仅当应用已非完全活跃（正在离开）才发——控制中心快速
+    /// 关闭回到活跃态时不会弹小窗；停留的控制中心场景小窗会短暂出现，
+    /// 回前台自动关闭自愈。
     private func enterAuto(_ result: @escaping FlutterResult) {
         guard let pip = controller else {
             NSLog("SimpleLive PiP: enterAuto ignored, no session")
+            result(false); return
+        }
+        guard UIApplication.shared.applicationState != .active else {
+            NSLog("SimpleLive PiP: enterAuto ignored, app fully active")
             result(false); return
         }
         guard !pip.isPictureInPictureActive, entryResult == nil,
