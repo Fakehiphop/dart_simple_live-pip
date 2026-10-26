@@ -721,11 +721,19 @@ final class IosPictureInPictureController: NSObject,
         NSLog("SimpleLive PiP: start failed %@", details.description)
         finishEntry(false, error: FlutterError(code: "pip_start_failed",
             message: "\(failure.domain) (\(failure.code))", details: details))
-        // v5：后台里的启动失败（-1001 等，场景态不允许）保留会话继续
-        // 保温热——拆了再建只会引入会话抖动，而系统自动启动仍可能随后
-        // 拉起；前台路径的失败才整段清理（点播手动进入需重置状态）。
-        if enteredBackground && autoStartArmed {
+        // v10：自动路径的启动失败一律保留会话（软失败）。v9.1 日志铁证：
+        // inactive 显式 start 在场景失活期被 -1001 拒绝后整段 cleanUp，
+        // Dart 检测到失活随即重建（session created + 新纹理 ID 20→25），
+        // Pegasus 远程对象每次都被换新——SpringBoard 的"喂熟"计数清零，
+        // 系统自动启动永远学不会，"手动出过一次后上滑才正常"正对应
+        // 远程对象被同一会话持续喂养的时段。会话是常驻温热的，失败只
+        // 意味着这一次系统没接，拆掉它只会更糟；回前台/页面关闭才有
+        // 整段清理。
+        if autoStartArmed {
             activeFeed = false
+            // 手动失败也应复位进入意图，否则 suspendOnStart 残留会
+            // 挡住 enterAuto 的后续自动启动。
+            suspendOnStart = false
             return
         }
         cleanUp()
