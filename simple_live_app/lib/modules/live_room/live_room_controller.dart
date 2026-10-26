@@ -3964,18 +3964,20 @@ ${errorStackTrace ?? ""}''');
           liveStatus.value &&
           !listenMode.value &&
           player.state.playing) {
-        unawaited(armIosPipForBackground());
-        unawaited(prepareIosPipForResign());
-        // v10：inactive 显式启动立即发出，去掉 0.25s 去抖。v9.1 日志
-        // 铁证：上滑时 systemGesture 失活在 250ms 内完成（SpringBoard
-        // 日志 05:08:32.2 添加断言 → 05:08:32.5 场景失活），去抖到点时
-        // 场景已不在前台，AVKit 判 isPictureInPicturePossible=NO、
-        // contentDimensions=(0,0)，显式 start 必被 -1001 拒绝。防误弹
-        // 由原生 applicationState != .active 闸门承担：控制中心等短暂
-        // 失焦时应用仍 fully active，enterAuto 在原生侧直接拒绝，不会
-        // 弹小窗；真上滑时应用已非 active，恰好在系统失活断言添加后、
-        // 场景渲染快照被夺走前的窗口内把 start 发出去。
-        unawaited(enterIosPipForBackground());
+        // v11：三步串行，修掉 v10 引入的竞态。v10 把 enterAuto 改为
+        // inactive 瞬间发出（unawaited 与 prepareIosPipForResign 并发），
+        // 但 enterIosPipForBackground 的闸门 iosPipActiveOrEntering 含
+        // _armFlight.isRunning——prepareIosPipForResign 的 ensurePrepared
+        // 先入单飞闸门，enterAuto 同一 tick 到达即被静默吞掉（v10 真机
+        // 日志 05:58:45：第二次 attach 跑了，startPictureInPicture issued
+        // 全程 0 条）。现在串行：先同步最新状态（幂等），完成后必然
+        // 已过单飞窗口，再发 enterAuto——总耗时一次 attach 往返，仍在
+        // systemGesture 失活窗口内（数十毫秒级）。防误弹仍由原生
+        // applicationState != .active 闸门承担。
+        unawaited(() async {
+          await prepareIosPipForResign();
+          await enterIosPipForBackground();
+        }());
       }
     }
   }
