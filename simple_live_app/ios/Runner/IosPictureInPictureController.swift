@@ -12,14 +12,23 @@ import UIKit
 //   2. 镜像层改为会话期 addSubview 正常上屏（Kazumi 同款），退出即移除。
 //      v3 的 insertSubview(at:0) 埋进根视图底层，打乱 Flutter 叠层 z 序
 //      （控制菜单被直播画面挡住的来源），也让系统自动拉起永远不触发。
-//   3. 上滑回桌面的自动画中画不再赌系统自动拉起（v3 日志证明从未发生），
-//      也不押注 canStartPictureInPictureAutomaticallyFromInline——
-//      Kazumi 原版该开关恒为 false 且未实现上滑路径。v4 在 inactive
-//      （仍在前台）瞬间显式走手动进入同序列：attach→软件渲染→
+//   3. v4 在 inactive（仍在前台）瞬间显式走手动进入同序列：attach→软件渲染→
 //      startPictureInPicture + suspend，该序列已真机验证"秒进不卡"。
 //   保留 v3的有效部分：回前台自动 stop（enteredBackground 守卫防回环）、
 //   时基纪律（PTS 来自 controlTimebase，不用 DisplayImmediately）、
 //   960px 长边上限、vImage CPU 缩放、有界缓冲池、全链日志。
+//
+// v5（v4 真机日志 20261026_205224 的三处修正）：
+//   a. suspend 从"发出 start 之后立刻执行"移到 will start 回调里——start
+//      被系统接受后再挂起应用。v4 日志中 4 次 -1001 失败的场景：挂起与启动
+//      赛跑，场景先离屏导致 AVKit 拒绝启动。移位后失败时应用仍在前台，
+//      补上 -1001 的 0.3s 重试（最多 2 次）。
+//   b. 开启 canStartPictureInPictureAutomaticallyFromInline（经
+//      setAutoStartEnabled 由 Dart 按设置项控制）：镜像层已真实上屏，
+//      上滑回桌面时由系统直接拉起，与 inactive 显式进入互为双保险。
+//      v3 时代它从未触发是埋层问题，不是开关问题。
+//   c. 直播 timeRange：Dart 侧恒报 duration=0，系统小窗按直播样式渲染
+//      （无进度条、无快进 10s）。
 @available(iOS 15.0, *)
 private final class PipVideoView: UIView {
     override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
@@ -44,6 +53,7 @@ final class IosPictureInPictureController: NSObject,
     private var entryResult: FlutterResult?
     private var startRequested = false
     private var suspendOnStart = false
+    private var startRetryCount = 0
     private var restoring = false
     private var textureId: Int64?
     private var playing = false
@@ -89,11 +99,11 @@ final class IosPictureInPictureController: NSObject,
             case "enter":
                 self.enter(result)
             case "setAutoStartEnabled":
-                // v4 放弃系统自动拉起（v3 日志证明从未触发）。保留通道兼容，
-                // 只记录并确认，供 Dart 保留统一武装流程。
+                // v5：系统自动拉起重新启用（镜像层已真实上屏，v3 时代它
+                // 从未触发是埋层问题）。由 Dart 按设置项与直播状态控制。
                 autoStartArmed = args["enabled"] as? Bool == true
-                NSLog("SimpleLive PiP: autoStart %@ no-op (v4 uses explicit start on inactive)",
-                      autoStartArmed ? "arm" : "disarm")
+                controller?.canStartPictureInPictureAutomaticallyFromInline = autoStartArmed
+                NSLog("SimpleLive PiP: autoStart %@", autoStartArmed ? "arm" : "disarm")
                 result(true)
             case "dispose":
                 self.finishEntry(false)
@@ -239,7 +249,7 @@ final class IosPictureInPictureController: NSObject,
                 sampleBufferDisplayLayer: view.displayLayer, playbackDelegate: self)
             let pip = AVPictureInPictureController(contentSource: content)
             pip.delegate = self
-            pip.canStartPictureInPictureAutomaticallyFromInline = false
+            pip.canStartPictureInPictureAutomaticallyFromInline = autoStartArmed
             controller = pip
             NSLog("SimpleLive PiP: session created")
         }
@@ -354,14 +364,24 @@ final class IosPictureInPictureController: NSObject,
         guard entryResult != nil, !startRequested, hasDisplayableFrame,
               let pip = controller, pip.isPictureInPicturePossible else { return }
         startRequested = true
-        NSLog("SimpleLive PiP: startPictureInPicture issued %@",
-              suspendOnStart ? "(explicit + suspend)" : "(auto)")
+        // v5：suspend 移到 will start 回调（系统接受启动后再挂起）。
+        // v4 在发出 start 后立刻挂起，上滑场景里场景离屏与启动赛跑，
+        // 日志 4 次 -1001 失败皆源于此。
+        NSLog("SimpleLive PiP: startPictureInPicture issued")
         pip.startPictureInPicture()
-        if suspendOnStart {
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self, self.textureId != nil else { return }
-                UIApplication.shared.perform(NSSelectorFromString("suspend"))
-            }
+    }
+
+    /// -1001（AVKitErrorDomain：系统判定当前起点无法开始画中画）短暂重试：
+    /// 失败时应用仍在前台（suspend 已移到 will start 之后再挂起），
+    /// 内容全部就绪（possible=true hasFrame=true）时再试一次即可通过。
+    private func retryStartAfterFailure() {
+        guard entryResult != nil, startRetryCount < 2,
+              controller != nil, enteredBackground == false else { return }
+        startRetryCount += 1
+        startRequested = false
+        NSLog("SimpleLive PiP: retry start (%ld/2) after -1001", startRetryCount)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.startIfPossible()
         }
     }
 
@@ -398,6 +418,7 @@ final class IosPictureInPictureController: NSObject,
         frameSize = .zero
         restoring = false
         startRequested = false
+        startRetryCount = 0
         suspendOnStart = false
         activeFeed = false
         lastEnqueueAt = 0
@@ -536,7 +557,14 @@ final class IosPictureInPictureController: NSObject,
     func pictureInPictureControllerWillStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         guard controller === pictureInPictureController else { return }
         activeFeed = true
-        NSLog("SimpleLive PiP: will start (%@)", suspendOnStart ? "explicit" : "auto")
+        NSLog("SimpleLive PiP: will start (auto#system)" + (suspendOnStart ? " + suspend" : ""))
+        if suspendOnStart {
+            // v5：启动已被系统接受，此刻挂起应用让小窗动画与桌面动画衔接。
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.textureId != nil else { return }
+                UIApplication.shared.perform(NSSelectorFromString("suspend"))
+            }
+        }
         channel.invokeMethod("onModeChanged", arguments: ["isInPipMode": true])
     }
 
@@ -559,6 +587,12 @@ final class IosPictureInPictureController: NSObject,
             details["underlyingCode"] = underlying.code
         }
         NSLog("SimpleLive PiP: start failed %@", details.description)
+        // 内容就绪（possible/hasFrame/layer 全 OK）却收到 -1001：
+        // 启动与场景离屏赛跑的瞬时竞态，短暂重试；其余错误照常收场。
+        if failure.domain == "AVKitErrorDomain", failure.code == -1001 {
+            retryStartAfterFailure()
+            return
+        }
         finishEntry(false, error: FlutterError(code: "pip_start_failed",
             message: "\(failure.domain) (\(failure.code))", details: details))
         // 失败即恢复 GL：本次尝试到此为止，不留软件渲染空转。

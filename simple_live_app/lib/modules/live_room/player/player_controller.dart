@@ -1659,6 +1659,11 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     }
     _iosPipAutoStartArmed = await pip.ensurePrepared();
     Log.d('iOS PiP: 早武装${_iosPipAutoStartArmed ? '完成（会话已建立）' : '失败'}');
+    if (_iosPipAutoStartArmed) {
+      // v5：武装期即开启系统自动拉起（镜像层已真实上屏），
+      // 上滑回桌面由 AVKit 直接启动小窗，与 inactive 显式进入双保险。
+      await pip.setAutoStartEnabled(true);
+    }
   }
 
   /// 退后台自动画中画：inactive 阶段（仍在前台）显式进入。
@@ -1702,6 +1707,14 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     await _disposeIosPip();
   }
 
+  /// 仅关闭系统自动拉起（不释放会话）：回前台后小窗不应再被系统拉起。
+  Future<void> updateIosPipAutoStart(bool enabled) async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    await _iosPip?.setAutoStartEnabled(enabled);
+  }
+
   /// 创建 iOS 画中画会话（与播放器同生命周期，离开页面时释放）。
   void _ensureIosPipSession() {
     if (!Platform.isIOS || _iosPip != null) {
@@ -1732,7 +1745,8 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
         textureId: videoController.id.value,
         playing: player.state.playing,
         position: player.state.position,
-        duration: player.state.duration,
+        // 直播时间轴恒报 0：原生层按直播样式渲染小窗（无进度条/快进）。
+        duration: pipIsLiveTimeline ? Duration.zero : player.state.duration,
         rate: player.state.rate,
         sourceRect: _iosPipSourceRect(),
       ),
@@ -1756,6 +1770,18 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     iosInPipState.value = active;
     if (!active) {
       _iosPipAutoStartArmed = false;
+      // v5：小窗关闭（回 app 或用户点收起）后，mpv 停在 GL 恢复/中断后的
+      // 暂停态，backboardd 事件已经过去，resumed 分支不再触发——
+      // 这里是恢复自动播放的唯一可靠位置。
+      if (!listenModeEnabled &&
+          !_playerClosing &&
+          AppSettingsController.instance.autoPipOnExit.value) {
+        unawaited(
+          player.play().catchError((Object e) {
+            Log.d('iOS PiP: 小窗关闭后自动恢复播放失败: $e');
+          }),
+        );
+      }
     }
     _iosPipSyncTimer?.cancel();
     if (active) {
@@ -2275,6 +2301,10 @@ class PlayerController extends BaseController
 
   /// App 是否处于后台（LiveRoomController 覆盖）
   bool get isAppBackground => false;
+
+  /// 画中画时间轴按点播还是直播样式渲染（LiveRoomController 覆盖）。
+  /// 直播恒报 duration=0：系统小窗显示直播样式（无进度条、无快进跳转）。
+  bool get pipIsLiveTimeline => false;
 
   /// 听直播模式（LiveRoomController 覆盖）：
   /// 开启时无条件保持后台播放服务，且不依赖"允许后台播放"设置

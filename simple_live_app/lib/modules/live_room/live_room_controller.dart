@@ -1439,6 +1439,10 @@ class LiveRoomController extends PlayerController
   /// 是否处于听直播模式
   var listenMode = false.obs;
 
+  /// 直播间画中画按直播时间轴渲染（点播式进度条与快进不适用于直播）。
+  @override
+  bool get pipIsLiveTimeline => true;
+
   /// 听直播定时关闭剩余秒数（0 = 未启用）
   var listenExitCountdown = 0.obs;
 
@@ -3922,8 +3926,10 @@ ${errorStackTrace ?? ""}''');
       _iosResignEntrySeen = false;
       _resumePlaybackForWindowsMinimize();
       if (Platform.isIOS) {
-        // 回前台且画中画未启动：解除武装，恢复 GL 渲染
+        // 回前台且画中画未启动：解除武装，恢复 GL 渲染，
+        // 并关闭系统自动拉起（避免入口内通电中心等误触时小窗自动弹出）。
         unawaited(disarmIosPipForBackground());
+        unawaited(updateIosPipAutoStart(false));
       }
       if (_iosPausedInBackgroundFallback) {
         _iosPausedInBackgroundFallback = false;

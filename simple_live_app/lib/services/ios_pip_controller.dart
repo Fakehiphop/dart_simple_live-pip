@@ -193,6 +193,21 @@ class IosPipController {
     }
   }
 
+  /// v5：开启/关闭系统自动拉起（上滑回桌面画中画）。
+  /// 镜像层会话期真实上屏后，该开关由 AVKit 在退后台瞬间消费。
+  Future<void> setAutoStartEnabled(bool enabled) async {
+    try {
+      await _channel.invokeMethod<void>(
+        'setAutoStartEnabled',
+        {'enabled': enabled},
+      );
+    } on PlatformException catch (error) {
+      Log.w('iOS PiP: autoStart 切换失败: $error');
+    } on MissingPluginException {
+      // 无原生桥（低版本 iOS）：无意义。
+    }
+  }
+
   Future<void> synchronize() async {
     if (!keepPlaybackInBackground || !_bridge.ownsNative(this)) return;
     try {
