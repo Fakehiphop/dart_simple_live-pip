@@ -1637,15 +1637,14 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     return pip != null && pip.keepPlaybackInBackground;
   }
 
-  /// 是否已预武装"退后台系统自动启动"。
+  /// 是否已预武装（会话已建立，inactive 时可直接显式进入）。
   bool get iosPipAutoStartArmed => _iosPipAutoStartArmed;
   bool _iosPipAutoStartArmed = false;
 
-  /// iOS 画中画早武装：开播即建立会话并打开系统自动启动开关
-  /// （canStartPictureInPictureAutomaticallyFromInline）。自动启动的判定
-  /// 发生在退后台瞬间，武装不能压在那几百毫秒里。
-  /// v3：帧管线全程温热（未进小窗 4fps 保温），无重操作，随建随武装。
-  /// 幂等：会话已就绪时重复调用是空操作。
+  /// iOS 画中画早武装：开播即建立会话（内容源 + 帧观测）。
+  /// v4 不再使用系统自动拉起（v2/v3 日志证明从未触发）；武装只让
+  /// inactive 瞬间的显式进入更短。会话无常驻帧泵（帧由事件驱动），
+  /// 开播后开销为零。幂等。
   Future<void> armIosPipForBackground() async {
     if (!Platform.isIOS || _playerClosing) {
       return;
@@ -1659,28 +1658,38 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
       return;
     }
     _iosPipAutoStartArmed = await pip.ensurePrepared();
-    Log.d(
-        'iOS PiP: 早武装${_iosPipAutoStartArmed ? '完成（系统自动启动已开启）' : '失败'}');
+    Log.d('iOS PiP: 早武装${_iosPipAutoStartArmed ? '完成（会话已建立）' : '失败'}');
   }
 
-  /// 退后台收尾（应用 inactive 阶段调用）。v3 无需切换软件渲染——
-  /// GPU 渲染管线全程恒定，帧镜像持续喂养；这里只同步一次最新状态。
+  /// 退后台自动画中画：inactive 阶段（仍在前台）显式进入。
+  /// v4 放弃系统自动拉起，走手动进入同序列（真机验证"秒进不卡"）：
+  /// attach → 切软件渲染 → startPictureInPicture + suspend。
   Future<void> prepareIosPipForResign() async {
-    if (!Platform.isIOS || _playerClosing || !_iosPipAutoStartArmed) {
+    if (!Platform.isIOS || _playerClosing) {
       return;
     }
     if (iosPipActiveOrEntering) {
       return;
     }
+    _ensureIosPipSession();
     final pip = _iosPip;
     if (pip == null) {
       return;
     }
-    final ok = await pip.prepareForBackground();
-    Log.d('iOS PiP: 退后台收尾${ok ? '完成（状态已同步，管线温热）' : '失败'}');
+    // 未早武装时现建会话（幂等）。
+    if (!_iosPipAutoStartArmed) {
+      _iosPipAutoStartArmed = await pip.ensurePrepared();
+    }
+    if (!_iosPipAutoStartArmed) {
+      Log.d('iOS PiP: 失焦进入跳过（会话建立失败）');
+      return;
+    }
+    final result = await pip.enterIosPipForResign();
+    Log.d('iOS PiP: 失焦显式进入 → ${result?.name ?? 'skipped'}');
+    // 未进入（notReady 等）时不提示：paused 阶段的兜底逻辑接管。
   }
 
-  /// 解除武装（回前台）：v3 无渲染器恢复步骤，仅在必要时释放会话。
+  /// 解除武装（回前台且未启动小窗时）：释放轻会话。
   Future<void> disarmIosPipForBackground() async {
     if (!Platform.isIOS || !_iosPipAutoStartArmed) {
       return;
@@ -2526,8 +2535,8 @@ class PlayerController extends BaseController
         unawaited(_syncBackgroundPlayback());
         Log.d("Playing");
         refreshIosVideoOutputLimit(force: true);
-        // iOS 早武装：开播即建立画中画会话并打开系统自动启动开关。
-        // 自动启动的判定窗口在上滑/退桌面的瞬间，会话必须早于情绪时刻就绪。
+        // iOS 早武装：开播即建立画中画会话（帧走事件驱动，会话零开销），
+        // 失焦（inactive）的显式进入随之更短。
         if (!listenModeEnabled &&
             AppSettingsController.instance.autoPipOnExit.value) {
           unawaited(armIosPipForBackground());

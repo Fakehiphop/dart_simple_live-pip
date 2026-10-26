@@ -3919,6 +3919,7 @@ ${errorStackTrace ?? ""}''');
       Log.d("返回前台");
       _refreshAutoExitCountdown();
       isBackground = false;
+      _iosResignEntrySeen = false;
       _resumePlaybackForWindowsMinimize();
       if (Platform.isIOS) {
         // 回前台且画中画未启动：解除武装，恢复 GL 渲染
@@ -3953,15 +3954,16 @@ ${errorStackTrace ?? ""}''');
     } else if (state == AppLifecycleState.inactive) {
       Log.d("应用短暂失焦:$state");
       unawaited(syncAutoPipOnLeave());
-      // iOS：趁仍在前台确认退后台画中画就绪（温热管线 + 系统自动启动开关）。
-      // 早武装已随开播完成，这里幂等确认一次并同步最新播放状态，
-      // v3 无渲染器切换。失焦也可能来自控制中心等误触发，
-      // 回前台时解除武装即可。
+      // iOS：失焦瞬间（仍在前台）显式进入画中画——v4 放弃系统自动拉起
+      // （v2/v3 日志证明从未触发），直接走手动进入同序列（真机验证
+      // "秒进不卡"）：attach → 切软件渲染 → start + suspend。
+      // 失焦也可能来自控制中心等误触发，回前台自动关窗即可。
       if (Platform.isIOS &&
           AppSettingsController.instance.autoPipOnExit.value &&
           liveStatus.value &&
           !listenMode.value &&
           player.state.playing) {
+        _iosResignEntrySeen = true;
         unawaited(armIosPipForBackground());
         unawaited(prepareIosPipForResign());
       }
@@ -3978,9 +3980,12 @@ ${errorStackTrace ?? ""}''');
   /// （该职责已从 Video 的 pauseUponEnteringBackgroundMode 移交至此）。
   bool _iosPausedInBackgroundFallback = false;
 
-  /// iOS 退后台：优先依赖"已武装的系统自动启动"拉起画中画；
-  /// 未武装成功时才走完整进入流程兜底；均未进入且未开启"允许后台播放"
-  /// 时暂停，保持与原 media_kit 行为一致。
+  /// inactive 分支已发起过显式进入（本轮退后台周期内）。
+  bool _iosResignEntrySeen = false;
+
+  /// iOS 退后台：inactive 已显式进入画中画（prepareIosPipForResign）。
+  /// 这里兜底——进入未完成/未发生时再试一次；均未进入且未开启
+  /// "允许后台播放"时暂停，保持与原 media_kit 行为一致。
   Future<void> _handleIosBackgroundPip() async {
     final wantAutoPip =
         AppSettingsController.instance.autoPipOnExit.value &&
@@ -3988,22 +3993,27 @@ ${errorStackTrace ?? ""}''');
             !listenMode.value &&
             player.state.playing;
     if (wantAutoPip) {
-      // 已武装（或进入中）：系统应在退后台瞬间自行拉起画中画，
-      // 这里只兜底——若延迟后仍未拉起则显式进入一次。
-      if (iosPipActiveOrEntering || iosPipAutoStartArmed) {
+      if (iosPipActiveOrEntering) {
         _iosPausedInBackgroundFallback = false;
-        _scheduleIosAutoPipFallbackStart();
+        if (!_iosResignEntrySeen) {
+          // inactive 的显式进入可能还在通道往返中，等它落地。
+          _scheduleIosAutoPipFallbackStart();
+        }
         return;
       }
-      try {
-        final entered = await autoEnterIosPipInBackground() ?? false;
-        if (entered) {
-          _iosPausedInBackgroundFallback = false;
-          return;
+      if (!_iosResignEntrySeen) {
+        // inactive 分支没有触发过进入（如 paused 直达），这里补一次。
+        try {
+          final entered = await autoEnterIosPipInBackground() ?? false;
+          if (entered) {
+            _iosPausedInBackgroundFallback = false;
+            return;
+          }
+        } catch (e) {
+          Log.d("iOS 后台自动画中画失败: $e");
         }
-      } catch (e) {
-        Log.d("iOS 后台自动画中画失败: $e");
       }
+      _iosResignEntrySeen = false;
     }
     // 进入中/已激活的画中画会话绝不能暂停播放器，否则小窗画面与声音冻结。
     if (iosPipActiveOrEntering) {
@@ -4023,8 +4033,8 @@ ${errorStackTrace ?? ""}''');
 
   bool _iosAutoPipFallbackStartScheduled = false;
 
-  /// 兜底：系统自动启动未发生时（武装时层内尚未就绪等），稍后显式进入。
-  /// 显式进入也失败则解除武装，停止后台无谓的保温帧拷贝。
+  /// 兜底：inactive 的显式进入可能仍在进行（通道往返），稍后确认。
+  /// 仍未进入则显式补一次；也失败则暂停兜底接管。
   void _scheduleIosAutoPipFallbackStart() {
     if (_iosAutoPipFallbackStartScheduled) {
       return;
@@ -4042,11 +4052,12 @@ ${errorStackTrace ?? ""}''');
           isPlayerClosing) {
         return;
       }
-      Log.d("iOS PiP: 系统自动启动未发生，尝试显式进入");
+      Log.d("iOS PiP: 失焦未进入，后台补一次显式进入");
       try {
         final entered = await autoEnterIosPipInBackground() ?? false;
         if (!entered) {
           await disarmIosPipForBackground();
+        }
         }
       } catch (e) {
         Log.d("iOS PiP: 兜底进入失败: $e");
