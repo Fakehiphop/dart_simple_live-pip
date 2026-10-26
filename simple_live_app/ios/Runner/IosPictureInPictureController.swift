@@ -199,7 +199,20 @@ final class IosPictureInPictureController: NSObject,
         let check = DispatchWorkItem { [weak self] in
             guard let self = self, let pip = self.controller else { return }
             guard self.autoStartArmed, !pip.isPictureInPictureActive, !self.stopRequested else { return }
-            NSLog("SimpleLive PiP: system auto start did not happen (1s, stays armed; explicit start in background is prohibited -1001)")
+            // v6 实测：武装后 2 秒内的首次退后台，SpringBoard 反复判定
+            // "可以自动拉起"却按兵不动（真机日志 22:05:42：ShouldAutoPiP
+            // YES 连发而 startPictureInPictureEnteringBackground 从未发出，
+            // 4 秒后的第二次退后台才正常）。系统自发的后台启动合法
+            // （-1001 只拦应用显式 start），这里把标志 OFF→ON 重新推给
+            // SpringBoard，逼它重新评估并补发错过的启动。
+            NSLog("SimpleLive PiP: system auto start did not happen (1s), re-arming flag to nudge SpringBoard")
+            pip.canStartPictureInPictureAutomaticallyFromInline = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                guard let self = self, let pip = self.controller,
+                      self.autoStartArmed, !pip.isPictureInPictureActive else { return }
+                pip.canStartPictureInPictureAutomaticallyFromInline = true
+                NSLog("SimpleLive PiP: autoStart flag re-armed (nudge while backgrounded)")
+            }
         }
         backgroundAutoStartCheck = check
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: check)
@@ -222,13 +235,28 @@ final class IosPictureInPictureController: NSObject,
         guard let pip = controller else { return }
         // 回 app 自动关闭小窗（PiP 关闭即回归行内，小窗不再残留）。
         // v5：只停小窗，会话保留（常驻温热，见 DidStop 软停止）。
-        // 启动过渡期（1.5s 内）的 didActivate 是启动自身的回声，跳过。
+        // 启动过渡期（1.5s 内）的 didActivate 可能是启动自身的回声，
+        // 跳过——但 v6 实测用户在过渡期内快速回 app 时这次跳过会永久
+        // 吞掉关闭（此后不再有 didBecomeActive，小窗一直挂着，真机
+        // "一次有一次没有"）。补一个延迟复查：回声场景应用不会停留
+        // 在前台（用户正在离开），快速返回场景应用保持 active，届时
+        // 补停即可。同时把可能被 OFF 窗口碰掉的标志同步回 armed。
+        pip.canStartPictureInPictureAutomaticallyFromInline = autoStartArmed
         let inStartTransition = lastWillStartAt > 0
             && CACurrentMediaTime() - lastWillStartAt < 1.5
         if pip.isPictureInPictureActive && !inStartTransition && !restoring {
             NSLog("SimpleLive PiP: became active, stopPictureInPicture issued (auto stop on return)")
             stopRequested = true
             pip.stopPictureInPicture()
+        } else if pip.isPictureInPictureActive && inStartTransition && !restoring {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self = self, let pip = self.controller,
+                      pip.isPictureInPictureActive, !self.restoring,
+                      UIApplication.shared.applicationState == .active else { return }
+                NSLog("SimpleLive PiP: delayed stop after start transition (return within guard window)")
+                self.stopRequested = true
+                pip.stopPictureInPicture()
+            }
         }
     }
 
