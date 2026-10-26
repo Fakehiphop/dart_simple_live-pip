@@ -468,8 +468,22 @@ final class IosPictureInPictureController: NSObject,
             result(false); return
         }
         guard !pip.isPictureInPictureActive, entryResult == nil,
-              hasEnqueuedFrame, suspendOnStart == false else {
+              suspendOnStart == false else {
             result(false); return
+        }
+        // v11：首帧闸门放宽——v10 真机日志 05:58:45 实证首次上滑极早
+        // （开播仅 2 秒，层内只有 4 帧保温帧，hasFrame=true 但统计计数
+        // 尚未刷新到日志），若首帧尚未入队就放弃，唯一可靠的首次路径
+        // 直接断线。改为无帧时兜底取一次最新纹理帧；仍无帧（解码器
+        // 尚未产出）才放弃，交回系统自动路径兜底。
+        if !hasEnqueuedFrame {
+            if let id = textureId, let buffer = copyPixelBuffer?(id) {
+                onVideoFrame(buffer, textureId: id)
+            }
+            guard hasEnqueuedFrame else {
+                NSLog("SimpleLive PiP: enterAuto ignored, no frame yet")
+                result(false); return
+            }
         }
         NSLog("SimpleLive PiP: startPictureInPicture issued (auto@inactive), possible=%@",
               pip.isPictureInPicturePossible ? "true" : "false")
