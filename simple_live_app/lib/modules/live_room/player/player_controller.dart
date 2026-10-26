@@ -593,6 +593,11 @@ mixin PlayerDanmakuMixin on PlayerStateMixin {
   }
 }
 mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
+  // 声明在最终类 PlayerController 上（LiveRoomController 覆盖），
+  // mixin 内的画中画逻辑需要感知它们，此处仅抽象声明。
+  bool get pipIsLiveTimeline;
+  bool get listenModeEnabled;
+
   final DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
 
   final pip = Floating();
