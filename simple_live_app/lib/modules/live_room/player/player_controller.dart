@@ -600,6 +600,9 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
   IosPipVideoOutputTransition? _iosPipTransition;
   IosPipController? _iosPip;
   Timer? _iosPipSyncTimer;
+  // v9：inactive 显式启动的去抖定时器（0.25s），短暂失焦（控制中心等）
+  // 在窗口内回前台时被取消，不弹小窗。
+  Timer? _iosInactivePipTimer;
   bool _androidWindowChannelActive = false;
   int? _androidWindowHandlerToken;
   bool _mobileSystemUiApplied = false;
