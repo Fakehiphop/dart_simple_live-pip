@@ -3,15 +3,21 @@ import Accelerate
 import Flutter
 import UIKit
 
-// 基于 Kazumi PR #2646（sibogentleman）的 media-kit 帧拦截 + 软件渲染切换方案，
-// 并吸收 SwiftPeek（GPL-3.0）验证过的自动启动路径：
-//   1. 开播即建会话（attach），canStartPictureInPictureAutomaticallyFromInline
-//      常开——退后台瞬间的自动启动由系统判定，武装链不能压在那几百毫秒里；
-//   2. 层内有持续新鲜的帧（30fps 采样、960px 长边上限、控制时基纪律，
-//      不与 kCMSampleAttachmentKey_DisplayImmediately 混用——AVFoundation
-//      头文件明确不建议）；
-//   3. 退后台前才切换软件渲染规避后台 GPU 提交限制，且该操作独立成步，
-//      失败可观测。
+// v3：放弃 Kazumi PR #2646 的"退后台前切换软件渲染"前置步骤，改走
+// PiliPlus（#3162，与本项目同构：media-kit 纹理帧 → AVSampleBufferDisplayLayer）
+// 已验证的全程温热管线方案，同时保留 SwiftPeek（GPL-3.0）的帧泵纪律：
+//   1. 全程不切换渲染器、不挂起视频轨：纹理 ID 恒定，帧镜像持续喂养
+//      （未进小窗 4fps 低速保温，进小窗/进入中 30fps 全速）。PiliPlus 用
+//      同构栈验证了这是后台自动画中画成立的充分条件；切换软件渲染会更换
+//      纹理、断开管线，是进小窗 1 秒卡顿、后台拉不起与 -1001 残留的根源。
+//   2. 回前台（didBecomeActive/didActivate）且画中画活跃时自动 stop
+//      （enteredBackground 守卫，PiliPlus 同款），并根除残留会话导致的
+//      AVKitErrorDomain -1001。
+//   3. 退后台 2 秒系统仍未拉起则原生兜底显式 startPictureInPicture 一次
+//      （Dart 侧另有 2.5 秒兜底，两条路径都有完整日志用于定案）。
+//   4. 时基纪律：PTS 来自 controlTimebase，不与
+//      kCMSampleAttachmentKey_DisplayImmediately 混用（30fps 采样、
+//      960px 长边上限、vImage CPU 缩放、单槽 latest、背压）。
 @available(iOS 15.0, *)
 private final class PipVideoView: UIView {
     override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
@@ -45,11 +51,19 @@ final class IosPictureInPictureController: NSObject,
     private var formatDescription: CMVideoFormatDescription?
     private var frameSize = CGSize.zero
 
-    // 帧泵纪律（SwiftPeek PiPFramePump 设计）：
-    // 直播采样 30fps 已足够（tunable），跳过的帧零拷贝开销。
-    private static let frameInterval: Double = 1.0 / 30.0
+    // 帧泵纪律（SwiftPeek PiPFramePump 设计，PiliPlus 同款双速）：
+    // 进小窗/进入中 30fps 全速；未进小窗 4fps 低速保温（层在 Flutter 视图
+    // 之下不可见，拷贝/缩放开销可忽略——vImage CPU 路线后台也可靠）。
+    private static let activeFrameInterval: Double = 1.0 / 30.0
+    private static let idleFrameInterval: Double = 0.25
     // 小窗物理尺寸有限，超采样是浪费；长边 960px。
     private static let maxLongEdge: Int = 960
+    /// 画中画激活或正在进入时为真（提高采样速率）。
+    private var activeFeed = false
+    private var autoStartArmed = false
+    private var enteredBackground = false
+    private var stopRequested = false
+    private var backgroundAutoStartCheck: DispatchWorkItem?
     private var lastEnqueueAt = 0.0
     private var enqueuedFrames = 0
     private var sourceFrames = 0
@@ -59,6 +73,7 @@ final class IosPictureInPictureController: NSObject,
     init(messenger: FlutterBinaryMessenger) {
         channel = FlutterMethodChannel(name: "simple_live/ios_pip", binaryMessenger: messenger)
         super.init()
+        registerLifecycleObservers()
         channel.setMethodCallHandler { [weak self] call, result in
             guard let self = self else { result(false); return }
             let args = call.arguments as? [String: Any] ?? [:]
@@ -68,7 +83,10 @@ final class IosPictureInPictureController: NSObject,
             case "attach":
                 self.attachSession(args, result: result)
             case "softwareRendering":
-                self.switchToSoftwareRendering(args, result: result)
+                // v3 已废弃：全程保持 GPU 渲染管线，不再切换软件渲染。
+                // 兼容旧 Dart 二进制的调用，只确认不做。
+                NSLog("SimpleLive PiP: softwareRendering ignored (obsolete in v3)")
+                result(nil)
             case "updatePlaybackState":
                 self.updatePlaybackState(args)
                 result(nil)
@@ -77,13 +95,15 @@ final class IosPictureInPictureController: NSObject,
             case "setAutoStartEnabled":
                 // 退后台自动启动的唯一正规机制（Apple 文档契约）：
                 // 后台时 startPictureInPicture() 不保证可用，须由系统在
-                // 用户退后台瞬间自行拉起。
+                // 用户退后台瞬间自行拉起。帧管线全程温热（保底 4fps），
+                // 层内恒有新鲜帧，随建随武装即可（PiliPlus 同款）。
                 let enabled = args["enabled"] as? Bool == true
                 guard let controller = self.controller else {
                     NSLog("SimpleLive PiP: autoStart \(enabled) ignored, no session")
                     result(false)
                     return
                 }
+                autoStartArmed = enabled
                 controller.canStartPictureInPictureAutomaticallyFromInline = enabled
                 NSLog("SimpleLive PiP: autoStart set to %@", enabled ? "true" : "false")
                 result(true)
@@ -110,8 +130,9 @@ final class IosPictureInPictureController: NSObject,
     }
 
     /// 建立画中画会话（内容源 + delegate + 时基），不切换渲染器。
-    /// 设计用于开播即调用（早武装）：前台期间硬件渲染的帧同样会经由
-    /// 纹理拦截器到达本层，软件切换留给退后台前的独立步骤。
+    /// 设计用于开播即调用（早武装）：GPU 渲染管线全程恒定，帧镜像
+    /// 持续（前台全速、未进小窗 4fps 保温），随后 setAutoStartEnabled
+    /// 打开系统自动启动开关即完成武装。
     private func attachSession(_ args: [String: Any], result: @escaping FlutterResult) {
         let prepared = prepareSource(args)
         if !prepared {
@@ -124,25 +145,59 @@ final class IosPictureInPictureController: NSObject,
         result(prepared)
     }
 
-    /// 切换 mpv 输出到软件渲染（评论后台 GPU 提交限制）。
-    /// 独立步骤：只应在退后台前调用；失败时记录，层内旧帧仍可维持
-    /// 系统的自动启动判定。
-    private func switchToSoftwareRendering(_ args: [String: Any], result: @escaping FlutterResult) {
-        guard controller != nil else {
-            NSLog("SimpleLive PiP: softwareRendering ignored, no session")
-            result(false); return
+    /// 应用级生命周期观察（控制器与 Flutter 引擎同生命周期，注册一次）：
+    /// 回前台自动 stop（修"回 app 小窗还在"），退后台做兜底启动检查。
+    private func registerLifecycleObservers() {
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.handleDidEnterBackground() }
+        // PiliPlus 注记：PiP 启动/停止也会广播前台场景通知，所以
+        // didActivate 必须以 enteredBackground 为前提，避免回环。
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.handleDidBecomeActive() }
+        NotificationCenter.default.addObserver(
+            forName: UIScene.didActivateNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.handleDidBecomeActive() }
+    }
+
+    private func handleDidEnterBackground() {
+        guard let pip = controller else { return }
+        enteredBackground = true
+        stopRequested = false
+        NSLog("SimpleLive PiP: didEnterBackground, autoStart=%@ possible=%@ active=%@ playing=%@ hasFrame=%@ src=%ld enq=%ld",
+              pip.canStartPictureInPictureAutomaticallyFromInline ? "true" : "false",
+              pip.isPictureInPicturePossible ? "true" : "false",
+              pip.isPictureInPictureActive ? "true" : "false",
+              playing ? "true" : "false",
+              hasEnqueuedFrame ? "true" : "false",
+              sourceFrames, enqueuedFrames)
+        // 系统应在退后台瞬间自行拉起（canStart…FromInline + 温热帧管线）。
+        // 给系统 2 秒；仍未拉起则原生兜底显式进入一次。
+        backgroundAutoStartCheck?.cancel()
+        guard autoStartArmed, !pip.isPictureInPictureActive, playing else { return }
+        let check = DispatchWorkItem { [weak self] in
+            guard let self = self, let pip = self.controller else { return }
+            guard self.autoStartArmed, !pip.isPictureInPictureActive, !self.stopRequested else { return }
+            NSLog("SimpleLive PiP: system auto start did not happen, fallback start issued (auto#fallback)")
+            pip.startPictureInPicture()
         }
-        guard let handle = args["handle"] as? NSNumber,
-              let useSoftwareRendering = useSoftwareRendering else {
-            NSLog("SimpleLive PiP: softwareRendering failed, no handle/renderer")
-            result(false); return
-        }
-        let generation = sessionGeneration
-        useSoftwareRendering(handle.int64Value) { [weak self] ready in
-            guard let self = self, self.sessionGeneration == generation else { result(false); return }
-            NSLog("SimpleLive PiP: softwareRendering %@", ready ? "ready" : "failed")
-            result(ready)
-        }
+        backgroundAutoStartCheck = check
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: check)
+    }
+
+    private func handleDidBecomeActive() {
+        guard enteredBackground else { return }
+        enteredBackground = false
+        backgroundAutoStartCheck?.cancel()
+        backgroundAutoStartCheck = nil
+        guard let pip = controller else { return }
+        // 回 app 自动关闭小窗（PiliPlus 同款），并顺带根除
+        // "上一会话系统侧仍活跃"导致的 AVKitErrorDomain -1001。
+        guard pip.isPictureInPictureActive else { return }
+        NSLog("SimpleLive PiP: became active, stopPictureInPicture issued (auto stop on return)")
+        stopRequested = true
+        pip.stopPictureInPicture()
     }
 
     private func prepareSource(_ args: [String: Any]) -> Bool {
@@ -277,6 +332,9 @@ final class IosPictureInPictureController: NSObject,
          "displayable": hasDisplayableFrame,
          "possible": controller?.isPictureInPicturePossible ?? false,
          "autoStart": controller?.canStartPictureInPictureAutomaticallyFromInline ?? false,
+         "autoStartArmed": autoStartArmed,
+         "enteredBackground": enteredBackground,
+         "sourceFrames": sourceFrames, "enqueuedFrames": enqueuedFrames,
          "audioCategory": AVAudioSession.sharedInstance().category.rawValue]
     }
 
@@ -317,6 +375,7 @@ final class IosPictureInPictureController: NSObject,
         sessionGeneration += 1
         clearEntryObservations()
         hasEnqueuedFrame = false
+        autoStartArmed = false
         controller?.delegate = nil
         controller = nil
         textureId = nil
@@ -330,12 +389,16 @@ final class IosPictureInPictureController: NSObject,
         restoring = false
         startRequested = false
         suspendOnStart = false
+        activeFeed = false
+        backgroundAutoStartCheck?.cancel()
+        backgroundAutoStartCheck = nil
         lastEnqueueAt = 0
         enqueuedFrames = 0
         sourceFrames = 0
         droppedFrames = 0
         lastStatsAt = 0
-        // Dart 侧的输出回调要等进行中的渲染器替换（及前台恢复 vid）完成后才能失效。
+        // v3 不再切换渲染器，restoreRendering 闭包即时返回；保留调用
+        // 以兼容 AppDelegate 现有接线。
         if let restoreRendering = restoreRendering {
             restoreRendering(completion)
         } else {
@@ -360,7 +423,10 @@ final class IosPictureInPictureController: NSObject,
         }
         // 采样节流：迟到的工作不追赶，跳过的帧零拷贝开销。
         let now = CACurrentMediaTime()
-        if lastEnqueueAt > 0, now - lastEnqueueAt < IosPictureInPictureController.frameInterval {
+        let interval = (activeFeed || entryResult != nil)
+            ? IosPictureInPictureController.activeFrameInterval
+            : IosPictureInPictureController.idleFrameInterval
+        if lastEnqueueAt > 0, now - lastEnqueueAt < interval {
             droppedFrames += 1
             logFrameStats(now: now)
             return
@@ -463,6 +529,7 @@ final class IosPictureInPictureController: NSObject,
         guard controller === pictureInPictureController else { return }
         // 自动启动路径的过渡保护：立即通知 Dart 进入 PiP 模式
         // （同步定时器提前运行，绘制状态不再漂移）。
+        activeFeed = true
         NSLog("SimpleLive PiP: will start (auto#@%@)", suspendOnStart ? "manual" : "system")
         channel.invokeMethod("onModeChanged", arguments: ["isInPipMode": true])
     }
@@ -476,6 +543,7 @@ final class IosPictureInPictureController: NSObject,
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                     failedToStartPictureInPictureWithError error: Error) {
         guard controller === pictureInPictureController else { return }
+        activeFeed = false
         let failure = error as NSError
         var details = entryDiagnostics()
         details["domain"] = failure.domain
@@ -493,9 +561,13 @@ final class IosPictureInPictureController: NSObject,
     func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         guard controller === pictureInPictureController else { return }
         let restored = restoring
+        let closedByApp = stopRequested
+        stopRequested = false
+        activeFeed = false
         finishEntry(false)
         cleanUp()
-        channel.invokeMethod("onModeChanged", arguments: ["isInPipMode": false, "restored": restored])
+        channel.invokeMethod("onModeChanged",
+            arguments: ["isInPipMode": false, "restored": restored, "closedByApp": closedByApp])
     }
 
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
