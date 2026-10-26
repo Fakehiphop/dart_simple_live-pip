@@ -12,8 +12,9 @@ import UIKit
 //      ——房间卡顿与菜单被"直播挡住"皆源于此。PiP 消费 AVSampleBuffer
 //      只依赖 layer 本身，不依赖视图正常展示。
 //   3. media_kit 后台 GPU 渲染停摆（v3 实证：小窗冻结在最后一帧；v1
-//      软件渲染路径实证后台可续帧）→ PiP 启动（WillStart）时切软件
-//      渲染，数完成后小窗持续 30fps——前台零卡顿与后台活画面兼得。
+//      软件渲染路径实证后台可续帧）→ 软件渲染在武装时刻预演切换
+//      （v6：真机实证启动时切换会让首个小窗卡 1-2 秒），WillStart 时
+//      管线已就绪，小窗全程 30fps——前台零卡与后台活画面兼得。
 //   4. 自动启动三路保险：a) 系统标志（退后台探针：镜像层临时摆回视频
 //      区域最顶层，回前台收回）；b) inactive 阶段显式 start（Dart 新
 //      通道 enterAuto，此时重活已全部就绪仅余一行调用）；c) 退后台 1 秒
@@ -260,16 +261,17 @@ final class IosPictureInPictureController: NSObject,
         guard !softwareSwitchDone, let handle = pendingRenderHandle,
               let useSoftwareRendering = useSoftwareRendering else {
             if !softwareSwitchDone {
-                NSLog("SimpleLive PiP: post-start software switch skipped (no handle/renderer)")
+                NSLog("SimpleLive PiP: software rendering switch skipped (no handle/renderer)")
                 softwareSwitchDone = true
             }
             return
         }
         softwareSwitchDone = true
         let generation = sessionGeneration
+        NSLog("SimpleLive PiP: software rendering switch issued (prewarm at arm / post-start)")
         useSoftwareRendering(handle) { [weak self] ready in
             guard let self = self, self.sessionGeneration == generation else { return }
-            NSLog("SimpleLive PiP: post-start software switch %@",
+            NSLog("SimpleLive PiP: software rendering switch %@",
                   ready ? "ready" : "failed (PiP may hold last frame)")
             if ready {
                 // 通知 Dart 立即把新纹理 ID 同步回来，缩短小窗静止间隙。
@@ -298,9 +300,8 @@ final class IosPictureInPictureController: NSObject,
             // v4：镜像层常态离屏（窗口左上角 1px、裁剪）。v3 实证插在
             // FlutterView 内的子视图位于 Flutter 绘制内容之上，前台会以
             // 4fps 镜像"顶替"真实直播——房间卡顿与菜单被"直播挡住"皆源于
-            // 此；且 media_kit 后台 GPU 渲染停摆（小窗冻结在最后一帧），
-            // 故在 PiP 启动后再切软件渲染（WillStart 回调）让小窗画面
-            // 活起来（回到 Kazumi/v1 实证有效的软件渲染路径）。
+            // 此；v6 起软件渲染在武装时刻预演切换（见 prepareSource 尾部），
+            // 小窗启动时管线已就绪，画面持续新鲜。
             view.clipsToBounds = true
             view.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
             videoView = view
@@ -323,6 +324,13 @@ final class IosPictureInPictureController: NSObject,
         if let buffer = copyPixelBuffer?(id.int64Value) {
             onVideoFrame(buffer, textureId: id.int64Value)
         }
+        // v6：预演切换移到武装时刻。此前小窗启动（WillStart）才切软件
+        // 渲染，切换管线（排空→重建纹理→注册等待→恢复）耗时 1-2 秒，
+        // 真机实证首个小窗必卡这一两秒；而软停止保住会话后"后续每次都
+        // 流畅"恰好证明管线就位即全程流畅。提前到前台开播瞬间切换
+        // （加载转圈窗口期，行内几乎无感），WillStart 时管线已就绪，
+        // 首个小窗零切换秒顺。后台会话不加新切换。
+        switchToSoftwareRenderingForPip()
         return true
     }
 
