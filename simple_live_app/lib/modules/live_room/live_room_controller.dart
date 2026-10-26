@@ -3921,8 +3921,6 @@ ${errorStackTrace ?? ""}''');
       isBackground = false;
       _resumePlaybackForWindowsMinimize();
       if (Platform.isIOS) {
-        // v9：取消 inactive 启动去抖——短暂失焦回前台不弹小窗。
-        _iosInactivePipTimer?.cancel();
         // v5：会话常驻温热，回前台不停小窗以外的任何东西，
         // 不解除武装也不释放会话（disarm 已为空操作），保证下一次
         // 退后台系统标志直接拉起。
@@ -3968,18 +3966,16 @@ ${errorStackTrace ?? ""}''');
           player.state.playing) {
         unawaited(armIosPipForBackground());
         unawaited(prepareIosPipForResign());
-        // v9：恢复 inactive 显式启动（v4 实证首次退后台唯一可靠路径；
-        // 系统自动启动对全新远程对象的首次退后台始终不发起，v7/v8 预
-        // 绑定与后台补推均无效）。0.25s 去抖只为让短暂失焦有回前台
-        // 取消的窗口——resumed 分支会取消本定时器；真退后台时 paused
-        // 先到、isBackground=true，到点必须照发（v9.1 修正：此前此处
-        // 误写 isBackground 就 return，恰好把真退后台全拦掉，enterAuto
-        // 从未发出）。防误弹最终由原生 applicationState 闸门兜底。
-        _iosInactivePipTimer?.cancel();
-        _iosInactivePipTimer = Timer(const Duration(milliseconds: 250), () {
-          if (isPlayerClosing || !liveStatus.value) return;
-          unawaited(enterIosPipForBackground());
-        });
+        // v10：inactive 显式启动立即发出，去掉 0.25s 去抖。v9.1 日志
+        // 铁证：上滑时 systemGesture 失活在 250ms 内完成（SpringBoard
+        // 日志 05:08:32.2 添加断言 → 05:08:32.5 场景失活），去抖到点时
+        // 场景已不在前台，AVKit 判 isPictureInPicturePossible=NO、
+        // contentDimensions=(0,0)，显式 start 必被 -1001 拒绝。防误弹
+        // 由原生 applicationState != .active 闸门承担：控制中心等短暂
+        // 失焦时应用仍 fully active，enterAuto 在原生侧直接拒绝，不会
+        // 弹小窗；真上滑时应用已非 active，恰好在系统失活断言添加后、
+        // 场景渲染快照被夺走前的窗口内把 start 发出去。
+        unawaited(enterIosPipForBackground());
       }
     }
   }
@@ -4039,10 +4035,6 @@ ${errorStackTrace ?? ""}''');
   }
 
   bool _iosAutoPipFallbackStartScheduled = false;
-
-  // v9：inactive 显式启动的去抖定时器（0.25s），短暂失焦（控制中心等）
-  // 在窗口内回前台时被取消，不弹小窗。
-  Timer? _iosInactivePipTimer;
 
   /// 兜底：系统自动启动未发生时稍后观察记录。v5 不再显式进入——
   /// 后台显式 startPictureInPicture 被系统禁止（场景态 Background，
