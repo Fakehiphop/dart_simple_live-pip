@@ -4058,7 +4058,6 @@ ${errorStackTrace ?? ""}''');
         if (!entered) {
           await disarmIosPipForBackground();
         }
-        }
       } catch (e) {
         Log.d("iOS PiP: 兜底进入失败: $e");
         unawaited(disarmIosPipForBackground());
