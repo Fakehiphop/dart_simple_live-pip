@@ -3921,7 +3921,9 @@ ${errorStackTrace ?? ""}''');
       isBackground = false;
       _resumePlaybackForWindowsMinimize();
       if (Platform.isIOS) {
-        // 回前台且画中画未启动：解除武装，恢复 GL 渲染
+        // v5：会话常驻温热，回前台不停小窗以外的任何东西，
+        // 不解除武装也不释放会话（disarm 已为空操作），保证下一次
+        // 退后台系统标志直接拉起。
         unawaited(disarmIosPipForBackground());
       }
       if (_iosPausedInBackgroundFallback) {
@@ -3964,9 +3966,10 @@ ${errorStackTrace ?? ""}''');
           player.state.playing) {
         unawaited(armIosPipForBackground());
         unawaited(prepareIosPipForResign());
-        // v4：inactive 阶段即显式启动（重活已就绪，只余一行 start），
-        // 系统标志拉起与后台双兜底之外的最可靠一路。
-        unawaited(enterIosPipForBackground());
+        // v5：不在 inactive 显式 start——失焦也会来自控制中心等
+        // （inactive ≠ 退后台），显式启动会把小窗弹到不想看到的场景。
+        // 自动拉起交给常驻温热会话上的系统标志（日志实证系统在退后台
+        // 过渡的精确时机自行拉起，首轮成功同款路径）。
       }
     }
   }
@@ -3992,20 +3995,21 @@ ${errorStackTrace ?? ""}''');
             player.state.playing;
     if (wantAutoPip) {
       // 已武装（或进入中）：系统应在退后台瞬间自行拉起画中画，
-      // 这里只兜底——若延迟后仍未拉起则显式进入一次。
+      // 这里只兜底——若延迟后仍未拉起则记录观察日志（不再显式进入）。
       if (iosPipActiveOrEntering || iosPipAutoStartArmed) {
         _iosPausedInBackgroundFallback = false;
         _scheduleIosAutoPipFallbackStart();
         return;
       }
-      try {
-        final entered = await autoEnterIosPipInBackground() ?? false;
-        if (entered) {
-          _iosPausedInBackgroundFallback = false;
-          return;
-        }
-      } catch (e) {
-        Log.d("iOS 后台自动画中画失败: $e");
+      // 未武装：真机日志实证后台显式 startPictureInPicture 一律被系统
+      // 拒绝（AVKitErrorDomain -1001，场景态 Background 不允许硬闯），
+      // 完整进入流程在此必失败。v5 只补武装（前台来不及的竞态），
+      // 下一次退后台由系统标志直接拉起；本次拉不起则按原行为暂停。
+      _iosPausedInBackgroundFallback = false;
+      await armIosPipForBackground();
+      if (iosPipActiveOrEntering || iosPipAutoStartArmed) {
+        _scheduleIosAutoPipFallbackStart();
+        return;
       }
     }
     // 进入中/已激活的画中画会话绝不能暂停播放器，否则小窗画面与声音冻结。
@@ -4026,8 +4030,10 @@ ${errorStackTrace ?? ""}''');
 
   bool _iosAutoPipFallbackStartScheduled = false;
 
-  /// 兜底：系统自动启动未发生时（武装时层内尚未就绪等），稍后显式进入。
-  /// 显式进入也失败则解除武装，停止后台无谓的保温帧拷贝。
+  /// 兜底：系统自动启动未发生时稍后观察记录。v5 不再显式进入——
+  /// 后台显式 startPictureInPicture 被系统禁止（场景态 Background，
+  /// AVKitErrorDomain -1001），合法路径只剩系统标志与 inactive 阶段的
+  /// enterAuto（均已就位）。这里只留日志供诊断，会话保持温热会比较久。
   void _scheduleIosAutoPipFallbackStart() {
     if (_iosAutoPipFallbackStartScheduled) {
       return;
@@ -4045,16 +4051,7 @@ ${errorStackTrace ?? ""}''');
           isPlayerClosing) {
         return;
       }
-      Log.d("iOS PiP: 系统自动启动未发生，尝试显式进入");
-      try {
-        final entered = await autoEnterIosPipInBackground() ?? false;
-        if (!entered) {
-          await disarmIosPipForBackground();
-        }
-      } catch (e) {
-        Log.d("iOS PiP: 兜底进入失败: $e");
-        unawaited(disarmIosPipForBackground());
-      }
+      Log.d("iOS PiP: 系统自动启动未发生（2.5s 观察，保持武装不硬闯）");
     });
   }
 
