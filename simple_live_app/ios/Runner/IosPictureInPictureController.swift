@@ -187,33 +187,44 @@ final class IosPictureInPictureController: NSObject,
               playing ? "true" : "false",
               hasEnqueuedFrame ? "true" : "false",
               sourceFrames, enqueuedFrames)
-        // 层内恒有新鲜帧 + 自动启动开关已开，系统应即拉起；1 秒仍未拉起
-        // 则显式 start 兜底（inactive 阶段重活已全部完成，仅余这一步）。
+        // 层内恒有新鲜帧 + 自动启动开关已开，系统应即拉起。
+        // v5：不再在后台显式 start 兜底——AVKit 日志实证场景态
+        // activationState=Background 时 startPictureInPicture 一律被拒
+        // （AVKitErrorDomain -1001，20:27 轮次五连败）。合法路径只剩：
+        // 系统标志自动启动 + inactive 阶段的显式 start（enterAuto）。
+        // 1 秒后仍未拉起只记录观察日志，不再硬闯。
         backgroundAutoStartCheck?.cancel()
         guard autoStartArmed, !pip.isPictureInPictureActive, playing else { return }
         let check = DispatchWorkItem { [weak self] in
             guard let self = self, let pip = self.controller else { return }
             guard self.autoStartArmed, !pip.isPictureInPictureActive, !self.stopRequested else { return }
-            NSLog("SimpleLive PiP: system auto start did not happen, fallback start issued (auto#background)")
-            pip.startPictureInPicture()
+            NSLog("SimpleLive PiP: system auto start did not happen (1s, stays armed; explicit start in background is prohibited -1001)")
         }
         backgroundAutoStartCheck = check
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: check)
     }
 
     private func handleDidBecomeActive() {
-        // 探针结束：镜像层收回离屏，取消后台兜底定时器。
-        mirrorConceal()
         backgroundAutoStartCheck?.cancel()
         backgroundAutoStartCheck = nil
         enteredBackground = false
+        // 探针收回改为延迟执行：用户从小窗点"返回"时（restore 流程），
+        // 收起动画以内容源图像为目标飞向 inline 位置，立即收回会让动画
+        // 目标消失、退回左上角默认方向（v4 实证）。恢复流程里 DidStop
+        // 之后另有延迟收回。
+        if !restoring {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self = self, !self.restoring else { return }
+                self.mirrorConceal()
+            }
+        }
         guard let pip = controller else { return }
-        // 回 app 自动关闭小窗（PiP 关闭即回归行内，小窗不再残留），
-        // 并根治"上一会话系统侧仍活跃"导致的 AVKitErrorDomain -1001。
+        // 回 app 自动关闭小窗（PiP 关闭即回归行内，小窗不再残留）。
+        // v5：只停小窗，会话保留（常驻温热，见 DidStop 软停止）。
         // 启动过渡期（1.5s 内）的 didActivate 是启动自身的回声，跳过。
         let inStartTransition = lastWillStartAt > 0
             && CACurrentMediaTime() - lastWillStartAt < 1.5
-        if pip.isPictureInPictureActive && !inStartTransition {
+        if pip.isPictureInPictureActive && !inStartTransition && !restoring {
             NSLog("SimpleLive PiP: became active, stopPictureInPicture issued (auto stop on return)")
             stopRequested = true
             pip.stopPictureInPicture()
@@ -299,13 +310,15 @@ final class IosPictureInPictureController: NSObject,
             pip.delegate = self
             pip.canStartPictureInPictureAutomaticallyFromInline = false
             controller = pip
+            // v5：仅在新建会话时复位软件渲染切换标记。常驻温热会话的
+            // 重进（软停止后 attach）渲染器已是软件态，重复切换会闪黑。
+            softwareSwitchDone = false
             NSLog("SimpleLive PiP: session created")
         }
         textureId = id.int64Value
         if let handle = args["handle"] as? NSNumber {
             pendingRenderHandle = handle.int64Value
         }
-        softwareSwitchDone = false
         updatePlaybackState(args)
         if let buffer = copyPixelBuffer?(id.int64Value) {
             onVideoFrame(buffer, textureId: id.int64Value)
@@ -332,7 +345,11 @@ final class IosPictureInPictureController: NSObject,
                                     width: rect["width"]?.doubleValue ?? 0,
                                     height: rect["height"]?.doubleValue ?? 0)
         }
-        controller?.requiresLinearPlayback = duration <= 0
+        // v5：本控制器专用直播页面——恒定直播语义。mpv 对直播 HLS 会把
+        // 缓冲长度报成时长（日志实证 ContentDuration=7.22s），系统因此在
+        // 小窗显示点播 UI（进度条+快进/快退10秒）。无限区间 + 线性播放
+        // 即三件套全消（LIVE 标记替代）。
+        controller?.requiresLinearPlayback = true
         controller?.invalidatePlaybackState()
         // 渲染后端切换会产生新的纹理 ID。暂停状态下可能只渲染一帧，
         // 所以在 Dart 侧上报新 ID 时立刻取一次。
@@ -659,7 +676,27 @@ final class IosPictureInPictureController: NSObject,
         NSLog("SimpleLive PiP: start failed %@", details.description)
         finishEntry(false, error: FlutterError(code: "pip_start_failed",
             message: "\(failure.domain) (\(failure.code))", details: details))
+        // v5：后台里的启动失败（-1001 等，场景态不允许）保留会话继续
+        // 保温热——拆了再建只会引入会话抖动，而系统自动启动仍可能随后
+        // 拉起；前台路径的失败才整段清理（点播手动进入需重置状态）。
+        if enteredBackground && autoStartArmed {
+            activeFeed = false
+            return
+        }
         cleanUp()
+    }
+
+    /// 软停止：复位进入态但保留会话/图层/像素池/纹理管线。
+    /// v5 核心变更——重建会话 during 后台必被系统拒绝（-1001），而保留
+    /// 常驻温热会话后系统自动启动在每次退后台都能立即拉起（首轮实证）。
+    private func softStopReset() {
+        entryTimeout?.cancel()
+        entryTimeout = nil
+        startRequested = false
+        suspendOnStart = false
+        activeFeed = false
+        lastWillStartAt = 0
+        finishEntry(false)
     }
 
     func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
@@ -667,7 +704,28 @@ final class IosPictureInPictureController: NSObject,
         let restored = restoring
         let closedByApp = stopRequested
         stopRequested = false
-        activeFeed = false
+        restoring = false
+        if closedByApp {
+            // 回 app 自动关闭：会话保留（软停止）。镜像层收回离屏。
+            softStopReset()
+            mirrorConceal()
+            channel.invokeMethod("onModeChanged",
+                arguments: ["isInPipMode": false, "restored": restored, "closedByApp": true])
+            return
+        }
+        if restored {
+            // 用户从小窗点"返回 app"：收起动画以镜像层（已摆在视频区）
+            // 为目标飞行。延迟收场让动画完成后再收回离屏；会话同样保留。
+            softStopReset()
+            channel.invokeMethod("onModeChanged",
+                arguments: ["isInPipMode": false, "restored": true])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self = self else { return }
+                self.mirrorConceal()
+            }
+            return
+        }
+        // 系统侧关闭（用户在小窗按关闭钮等）：与旧版一致，整段清理。
         finishEntry(false)
         cleanUp()
         channel.invokeMethod("onModeChanged",
@@ -677,6 +735,10 @@ final class IosPictureInPictureController: NSObject,
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
         restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
         restoring = true
+        // v4 问题"小窗关闭动画往左上角缩"的根因：收起动画以内容源 layer
+        // 的当前位置为目标飞，而镜像层常态在窗口左上角 1px 离屏。恢复前
+        // 先把它摆回直播页的视频区域，动画便飞向直播画面所在处。
+        mirrorExpose()
         channel.invokeMethod("onRestore", arguments: nil) { [weak self] result in
             let restored = result as? Bool ?? false
             self?.restoring = restored
@@ -689,10 +751,9 @@ final class IosPictureInPictureController: NSObject,
     }
 
     func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
-        // 直播是无限时间轴。有限区间会让小窗显示无意义的进度条。
-        duration > 0
-            ? CMTimeRange(start: .zero, duration: CMTime(seconds: duration, preferredTimescale: 1000))
-            : CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
+        // v5：恒定无限区间（直播）。任何有限区间都会让系统按点播渲染
+        // 进度条与 ±10 秒快进/快退按钮。
+        CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
     }
 
     func pictureInPictureControllerIsPlaybackPaused(_ pictureInPictureController: AVPictureInPictureController) -> Bool {

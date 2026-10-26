@@ -194,8 +194,17 @@ class IosPipController {
       if (!await _bridge.acquireNative(this) || !_ownsPage) {
         return IosPipEntryResult.failed;
       }
+      final handle = await playerHandle();
+      if (!_ownsPage) return IosPipEntryResult.failed;
+      // v5：手动路径同样把渲染句柄带给原生——否则 WillStart 后软件渲染
+      // 切换无 handle 可切（日志实证 "post-start software switch skipped
+      // (no handle/renderer)"），小窗在后台 GPU 停摆后冻结在最后一帧。
+      final attachArgs = <String, Object>{
+        ...state.toArguments(),
+        if (handle != null) 'handle': handle,
+      };
       final attached =
-          await _channel.invokeMethod<bool>('attach', state.toArguments());
+          await _channel.invokeMethod<bool>('attach', attachArgs);
       if (!_ownsPage) return IosPipEntryResult.failed;
       if (attached != true) return IosPipEntryResult.notReady;
       // v3：不再切换软件渲染，直接进入——管线全程温热，启动近乎即时。

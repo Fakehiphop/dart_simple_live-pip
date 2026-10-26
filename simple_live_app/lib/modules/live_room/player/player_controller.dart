@@ -1698,17 +1698,12 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     Log.d('iOS PiP: inactive 显式启动${issued ? '已发出' : '未发出（会话未就绪或已在进行）'}');
   }
 
-  /// 解除武装（回前台）：v3 无渲染器恢复步骤，仅在必要时释放会话。
+  /// 解除武装（回前台）。v5 改为空操作：会话常驻温热（与 PiliPlus
+  /// 同一模式）——回前台只停小窗，会话/管线/自动启动标志全部保留，
+  /// 下一次退后台系统标志直接拉起（重建会话在后台必被拒 -1001）。
+  /// 页面关闭时 _disposeIosPip 仍会整段释放。
   Future<void> disarmIosPipForBackground() async {
-    if (!Platform.isIOS || !_iosPipAutoStartArmed) {
-      return;
-    }
-    _iosPipAutoStartArmed = false;
-    if (iosPipActiveOrEntering) {
-      // 系统已拉起画中画，会话由正常生命周期管理。
-      return;
-    }
-    await _disposeIosPip();
+    return;
   }
 
   /// 创建 iOS 画中画会话（与播放器同生命周期，离开页面时释放）。
@@ -1763,9 +1758,9 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
 
   void _handleIosPipModeChanged(bool active, bool restored) {
     iosInPipState.value = active;
-    if (!active) {
-      _iosPipAutoStartArmed = false;
-    }
+    // v5：不再在 PiP 停止时解除武装。武装状态表达的是设置项
+    // （退后台自动画中画），直播页存活期间恒成立；卸了武装的下一次
+    // 退后台只能靠后台重建会话硬闯，而那必然 -1001（场景态不允许）。
     _iosPipSyncTimer?.cancel();
     if (active) {
       showControlsState.value = false;
