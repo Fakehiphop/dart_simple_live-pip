@@ -118,6 +118,24 @@ final class IosPictureInPictureController: NSObject,
                 autoStartArmed = enabled
                 controller.canStartPictureInPictureAutomaticallyFromInline = enabled
                 NSLog("SimpleLive PiP: autoStart set to %@", enabled ? "true" : "false")
+                if enabled {
+                    // v8：新房间会创建新的 Pegasus 远程对象，真机日志实证
+                    // SpringBoard 对全新对象的首次退后台不发起启动（判定
+                    // YES 却按兵不动），直到标志被重复推送多次后才认。
+                    // 在前台武装时刻主动 OFF→ON 重推两次，赶在用户首次
+                    // 上滑之前完成绑定（此处均为前台操作，无 -1001 风险）。
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                        guard let self = self, let c = self.controller,
+                              self.autoStartArmed, !c.isPictureInPictureActive else { return }
+                        c.canStartPictureInPictureAutomaticallyFromInline = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                            guard let self = self, let c = self.controller,
+                                  self.autoStartArmed, !c.isPictureInPictureActive else { return }
+                            c.canStartPictureInPictureAutomaticallyFromInline = true
+                            NSLog("SimpleLive PiP: autoStart flag re-pushed (bind new remote object)")
+                        }
+                    }
+                }
                 result(true)
             case "dispose":
                 self.finishEntry(false)
@@ -222,41 +240,25 @@ final class IosPictureInPictureController: NSObject,
         backgroundAutoStartCheck?.cancel()
         backgroundAutoStartCheck = nil
         enteredBackground = false
-        // 探针收回改为延迟执行：用户从小窗点"返回"时（restore 流程），
-        // 收起动画以内容源图像为目标飞向 inline 位置，立即收回会让动画
-        // 目标消失、退回左上角默认方向（v4 实证）。恢复流程里 DidStop
-        // 之后另有延迟收回。
+        // 探针立即收回。v7 实测延迟收回会在恢复窗口内露出镜像层——
+        // 用户此刻退出直播页会看到"直播画面跟着页面切出去"。
+        // restoring 守卫：若恢复流程已先行把镜像层摆回视频区（收缩
+        // 动画目标），不能收回（DidStop 后由恢复分支收回）。
         if !restoring {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                guard let self = self, !self.restoring else { return }
-                self.mirrorConceal()
-            }
+            mirrorConceal()
         }
         guard let pip = controller else { return }
         // 回 app 自动关闭小窗（PiP 关闭即回归行内，小窗不再残留）。
-        // v5：只停小窗，会话保留（常驻温热，见 DidStop 软停止）。
-        // 启动过渡期（1.5s 内）的 didActivate 可能是启动自身的回声，
-        // 跳过——但 v6 实测用户在过渡期内快速回 app 时这次跳过会永久
-        // 吞掉关闭（此后不再有 didBecomeActive，小窗一直挂着，真机
-        // "一次有一次没有"）。补一个延迟复查：回声场景应用不会停留
-        // 在前台（用户正在离开），快速返回场景应用保持 active，届时
-        // 补停即可。同时把可能被 OFF 窗口碰掉的标志同步回 armed。
+        // v8：取消 1.5s 启动过渡守卫——真机实测守卫期内返回会被跳过，
+        // 只能靠 0.6s 延迟复查补停，小窗要多挂约 1 秒才消失。回声保护
+        // 改由 applicationState 把关：真回 app 必然 active；启动回声期
+        // PiP 尚未 active 不会误停。回到前台立即关，不再等待。
         pip.canStartPictureInPictureAutomaticallyFromInline = autoStartArmed
-        let inStartTransition = lastWillStartAt > 0
-            && CACurrentMediaTime() - lastWillStartAt < 1.5
-        if pip.isPictureInPictureActive && !inStartTransition && !restoring {
+        if pip.isPictureInPictureActive && !restoring
+            && UIApplication.shared.applicationState == .active {
             NSLog("SimpleLive PiP: became active, stopPictureInPicture issued (auto stop on return)")
             stopRequested = true
             pip.stopPictureInPicture()
-        } else if pip.isPictureInPictureActive && inStartTransition && !restoring {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                guard let self = self, let pip = self.controller,
-                      pip.isPictureInPictureActive, !self.restoring,
-                      UIApplication.shared.applicationState == .active else { return }
-                NSLog("SimpleLive PiP: delayed stop after start transition (return within guard window)")
-                self.stopRequested = true
-                pip.stopPictureInPicture()
-            }
         }
     }
 
@@ -751,11 +753,13 @@ final class IosPictureInPictureController: NSObject,
         }
         if restored {
             // 用户从小窗点"返回 app"：收起动画以镜像层（已摆在视频区）
-            // 为目标飞行。延迟收场让动画完成后再收回离屏；会话同样保留。
+            // 为目标飞行。DidStop 在动画结束时到达，短暂缓冲后立即收回
+            // ——v7 的 0.8s 太长，用户立刻退出直播页会看到镜像层跟着
+            // 页面一起切出去（真机反馈）。
             softStopReset()
             channel.invokeMethod("onModeChanged",
                 arguments: ["isInPipMode": false, "restored": true])
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 guard let self = self else { return }
                 self.mirrorConceal()
             }
