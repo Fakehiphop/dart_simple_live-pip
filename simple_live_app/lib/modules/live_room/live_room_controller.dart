@@ -3970,12 +3970,14 @@ ${errorStackTrace ?? ""}''');
         unawaited(prepareIosPipForResign());
         // v9：恢复 inactive 显式启动（v4 实证首次退后台唯一可靠路径；
         // 系统自动启动对全新远程对象的首次退后台始终不发起，v7/v8 预
-        // 绑定与后台补推均无效）。0.25s 去抖：真正的退后台 inactive
-        // 会持续（紧接着 paused），控制中心下拉等短暂失焦会在窗口内
-        // 回到 active 而被原生 applicationState 闸门拒绝。
+        // 绑定与后台补推均无效）。0.25s 去抖只为让短暂失焦有回前台
+        // 取消的窗口——resumed 分支会取消本定时器；真退后台时 paused
+        // 先到、isBackground=true，到点必须照发（v9.1 修正：此前此处
+        // 误写 isBackground 就 return，恰好把真退后台全拦掉，enterAuto
+        // 从未发出）。防误弹最终由原生 applicationState 闸门兜底。
         _iosInactivePipTimer?.cancel();
         _iosInactivePipTimer = Timer(const Duration(milliseconds: 250), () {
-          if (isBackground) return;
+          if (isPlayerClosing || !liveStatus.value) return;
           unawaited(enterIosPipForBackground());
         });
       }
