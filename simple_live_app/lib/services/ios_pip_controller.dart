@@ -104,11 +104,11 @@ class IosPipController {
     return _entry.run(() => _enter(state));
   }
 
-  /// 早武装（SwiftPeek 的成功路径）：开播即建立会话并打开系统自动启动开关。
+  /// 早武装：开播即建立会话并打开系统自动启动开关。
   /// canStartPictureInPictureAutomaticallyFromInline 必须在退后台前就绪，
   /// 系统才会在上滑/退桌面的瞬间替应用拉起画中画——整条武装链不能压在
   /// inactive 阶段的几百毫秒里（此前三轮失败的原因）。
-  /// 软件渲染等重操作留给 prepareForBackground。幂等，返回是否就绪。
+  /// v3 帧管线全程温热，无重操作。幂等，返回是否就绪。
   Future<bool> ensurePrepared() async {
     if (!_ownsPage) return false;
     if (_active) return true;
@@ -143,35 +143,25 @@ class IosPipController {
     }
   }
 
-  /// 退后台收尾：切换软件渲染（规避后台 GPU 提交限制）并同步播放状态。
-  /// 在 inactive 阶段调用；此时应用仍可响应跨通道回调。
-  /// 若切换未能在系统判定前完成，层内帧依然新鲜（30fps 持续镜像），
-  /// 旧帧也足够系统完成自动启动判定。
+  /// 退后台收尾（inactive 阶段调用）。v3 全程保持 GPU 渲染管线，
+  /// 无需切换软件渲染（帧管线未进小窗时也以 4fps 保温），这里只在
+  /// 进入后台前同步一次最新播放状态。
   Future<bool> prepareForBackground() async {
     if (!_ownsPage) return false;
     if (_active) return true;
     if (!await ensurePrepared()) return false;
     if (!_ownsPage) return false;
-    final handle = await playerHandle();
-    if (!_ownsPage) return false;
-    if (handle == null) return false;
     try {
-      final ok = await _channel.invokeMethod<bool>(
-        'softwareRendering',
-        {'handle': handle},
-      );
-      if (!_ownsPage) return false;
-      if (ok != true) return false;
       await _channel.invokeMethod<void>(
         'updatePlaybackState',
         playbackState().toArguments(),
       );
       return true;
     } on PlatformException catch (error) {
-      Log.w('iOS PiP: 软件渲染切换失败: $error');
+      Log.w('iOS PiP: 退后台状态同步失败: $error');
       return false;
     } on MissingPluginException {
-      return false;
+      return true;
     }
   }
 
@@ -180,9 +170,6 @@ class IosPipController {
       final supported = await _channel.invokeMethod<bool>('isSupported');
       if (!_ownsPage) return IosPipEntryResult.failed;
       if (supported != true) return IosPipEntryResult.unsupported;
-      final handle = await playerHandle();
-      if (!_ownsPage) return IosPipEntryResult.failed;
-      if (handle == null) return IosPipEntryResult.notReady;
       if (!await _bridge.acquireNative(this) || !_ownsPage) {
         return IosPipEntryResult.failed;
       }
@@ -190,21 +177,7 @@ class IosPipController {
           await _channel.invokeMethod<bool>('attach', state.toArguments());
       if (!_ownsPage) return IosPipEntryResult.failed;
       if (attached != true) return IosPipEntryResult.notReady;
-      // 手动进入也需要软件渲染切换：进入小窗后应用处于后台，
-      // 硬件渲染受 GPU 提交限制会停摆。
-      final switched = await _channel.invokeMethod<bool>(
-        'softwareRendering',
-        {'handle': handle},
-      );
-      if (!_ownsPage) return IosPipEntryResult.failed;
-      if (switched != true) return IosPipEntryResult.notReady;
-      // 渲染切换可能重建原生输出并替换其纹理。
-      // 在进入前发送最新状态，而不是等待周期性同步。
-      await _channel.invokeMethod<void>(
-        'updatePlaybackState',
-        playbackState().toArguments(),
-      );
-      if (!_ownsPage) return IosPipEntryResult.failed;
+      // v3：不再切换软件渲染，直接进入——管线全程温热，启动近乎即时。
       final entered = await _channel.invokeMethod<bool>('enter');
       if (!_ownsPage) return IosPipEntryResult.failed;
       _active = entered == true;
