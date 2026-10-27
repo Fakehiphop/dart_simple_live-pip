@@ -48,6 +48,8 @@ void main(List<String> args) async {
   // 捕获 Flutter 框架错误
   FlutterError.onError = (FlutterErrorDetails details) {
     FlutterError.presentError(details);
+    debugPrint('PIPV13ERR ${details.exception}');
+    debugPrint('PIPV13ERR stack: ${details.stack}');
     Log.e(
       "Flutter Error: ${details.exception}",
       details.stack ?? StackTrace.current,

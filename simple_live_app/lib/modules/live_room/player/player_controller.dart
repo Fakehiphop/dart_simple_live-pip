@@ -221,6 +221,9 @@ mixin PlayerMixin {
   /// 订阅方用 Obx 监听本 Rx，创建完成前 Video 区域显示占位。
   final videoController = Rx<VideoController?>(null);
 
+  /// debug: 页面 Video 是否已构建（PIPV13DBG 打点用）
+  bool pipDebugVideoBuiltLogged = false;
+
   /// 幂等创建 VideoController（必须在访问 videoController.value 前完成）。
   Future<void> _ensureVideoController() async {
     if (videoController.value != null) {
@@ -230,6 +233,7 @@ mixin PlayerMixin {
       player,
       configuration: MpvOptionsService.videoControllerConfiguration(),
     );
+    debugPrint('PIPV13DBG vc created id=${videoController.value?.id}');
   }
 }
 
@@ -1624,6 +1628,7 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     if (textureId == null || textureId < 0) {
       return;
     }
+    debugPrint('PIPV13DBG arm pip textureId=$textureId');
     _iosPipAutoEnterArmed = true;
     IosPipHelper.enter(
       textureId,
@@ -2439,6 +2444,7 @@ class PlayerController extends BaseController
         return;
       }
 
+      debugPrint('PIPV13DBG stream error=$event');
       //SmartDialog.showToast(event);
       _cancelStablePlaybackTimer();
       mediaError(event);
@@ -2446,6 +2452,7 @@ class PlayerController extends BaseController
 
     _playingSubscription = player.stream.playing.listen((event) {
       playingState.value = event;
+      debugPrint('PIPV13DBG playing event=$event');
       final generation = playbackLoadGeneration;
       _syncStreamErrorGeneration(generation);
       if (event) {
@@ -2494,6 +2501,7 @@ class PlayerController extends BaseController
     _sizeSubscription = player.stream.size.listen((event) {
       final width = event.$1;
       final height = event.$2;
+      debugPrint('PIPV13DBG size event=${width}x$height');
       Log.d(
           'size:${width}x$height  W:${(player.state.width)}  H:${(player.state.height)}');
 

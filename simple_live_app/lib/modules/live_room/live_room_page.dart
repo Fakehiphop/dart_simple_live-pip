@@ -707,6 +707,10 @@ class LiveRoomPage extends GetView<LiveRoomController> {
         ),
         Obx(() {
           final vc = controller.videoController.value;
+          if (controller.pipDebugVideoBuiltLogged != (vc != null)) {
+            controller.pipDebugVideoBuiltLogged = vc != null;
+            debugPrint('PIPV13DBG page video vc=${vc != null}');
+          }
           if (vc == null) {
             // PiliPlus 路线：VideoController 异步创建，完成前显示占位。
             return const Positioned.fill(
