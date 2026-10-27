@@ -44,7 +44,6 @@ final class IosPictureInPictureController: NSObject,
     private var entryTimeout: DispatchWorkItem?
     private var entryResult: FlutterResult?
     private var startRequested = false
-    private var startRetries = 0
     private var willStartAt: Double = 0
     private var suspendOnStart = false
     private var restoring = false
@@ -86,6 +85,7 @@ final class IosPictureInPictureController: NSObject,
     /// Replace：高频 Replace 是资格翻 NOT 的诱因之一，11306 实测）。
     private var lastNowPlayingPlaying = false
     private var lastNowPlayingSynced = false
+    private var lastAutoEnterWritten = false
     // 锁屏封面（11310 同款）：每会话一次性生成 320×320 JPEG（CI 走
     // software renderer，后台 Metal 会被 BackgroundExecutionNotPermitted 拒），
     // 不再周期性整包 Replace。
@@ -327,7 +327,14 @@ final class IosPictureInPictureController: NSObject,
     /// 唯一的启动开关（PiliPlus 同构）：`autoEnter && hasFrame`。
     /// 帧到齐后重算一次即可，不需要 OFF→ON 反复重推。
     private func updateAutoEnterFlag() {
-        controller?.canStartPictureInPictureAutomaticallyFromInline = autoStartArmed && hasEnqueuedFrame
+        let value = autoStartArmed && hasEnqueuedFrame
+        // 边沿触发写：同值重写会在退后台过渡期惊动 Pegasus（860 日志：
+        // ShouldAutoPiP YES x6 后随一次 Client Update，最终 request NO）。
+        // PiliPlus 每周期只有一次 true 边沿，起窗判定全程安静。
+        if value != lastAutoEnterWritten {
+            lastAutoEnterWritten = value
+            controller?.canStartPictureInPictureAutomaticallyFromInline = value
+        }
         syncFeedPump()
     }
 
@@ -367,11 +374,21 @@ final class IosPictureInPictureController: NSObject,
     }
 
     private func prepareSource(_ args: [String: Any]) -> Bool {
+        // 退后台过渡期静默窗：Dart 生命周期重武装会在退后台瞬间打进
+        // attach+arm+updatePlaybackState 风暴，其远端交互与 SpringBoard
+        // 正在收尾的自动起窗判定互踩（860 日志：判定 YES x6 后被 NO，
+        // 场景弹回前台）。过渡期一律延后，回前台后 Dart 会重新武装。
+        if UIApplication.shared.applicationState != .active, !activeFeed,
+           controller?.isPictureInPictureActive != true {
+            NSLog("SimpleLive PiP: attach deferred (background transition)")
+            return false
+        }
         guard AVPictureInPictureController.isPictureInPictureSupported(),
               let id = args["textureId"] as? NSNumber,
               let window = Self.hostWindow() else { return false }
 
         if controller == nil {
+            lastAutoEnterWritten = false
             let view = PipVideoView()
             view.isUserInteractionEnabled = false
             view.displayLayer.videoGravity = .resizeAspect
@@ -444,6 +461,15 @@ final class IosPictureInPictureController: NSObject,
     }
 
     private func updatePlaybackState(_ args: [String: Any]) {
+        if UIApplication.shared.applicationState != .active, !activeFeed,
+           controller?.isPictureInPictureActive != true {
+            // 同 prepareSource 静默窗：invalidatePlaybackState/timebase/
+            // 镜像层布局都是过渡期禁忌，只记字段。
+            if let id = args["textureId"] as? NSNumber { textureId = id.int64Value }
+            playing = args["playing"] as? Bool ?? false
+            NSLog("SimpleLive PiP: updatePlaybackState deferred (background transition)")
+            return
+        }
         let oldTextureId = textureId
         if let id = args["textureId"] as? NSNumber { textureId = id.int64Value }
         playing = args["playing"] as? Bool ?? false
@@ -608,7 +634,6 @@ final class IosPictureInPictureController: NSObject,
         pixelBufferPoolSize = .zero
         formatDescription = nil
         startRequested = false
-        startRetries = 0
         suspendOnStart = false
         activeFeed = false
         stopFeedPump()
@@ -934,14 +959,10 @@ final class IosPictureInPictureController: NSObject,
         // （isReadyForMoreMediaData 长期 false，入队仅 ~11fps 抖动）；清掉
         // 入场前保温期积压的旧样本，让泵从空管线以 30Hz 重建画面。
         willStartAt = CACurrentMediaTime()
-        // 无条件 flush + 立即补帧（11310 策略，真机 A/B 用户裁定观感最佳）：
-        // 清空旧管线消除旧帧/新尺寸过渡，补帧保证窗口出现即有画面。
-        if #available(iOS 17.0, *) {
-            videoView?.displayLayer.sampleBufferRenderer.flush()
-        } else {
-            videoView?.displayLayer.flush()
-        }
-        // flush 清空管线后窗口第一瞬间无内容：立即补一帧，喂帧泵 33ms 后接管。
+        // PiliPlus 同构：willStart 不 flush，仅立即补一帧（force 跳过节流）。
+        // 无条件 flush 会清空已排队样本，小窗首瞬必空 1-2 帧（860 日志用户
+        // 复测"还是有一瞬间的卡顿"）；排队帧的病态自愈交给 enqueue 的
+        // failed/requiresFlush 守卫即可。
         if let id = textureId, let buffer = copyPixelBuffer?(id) {
             onVideoFrame(buffer, textureId: id, force: true)
         }
@@ -954,7 +975,6 @@ final class IosPictureInPictureController: NSObject,
 
     func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         guard controller === pictureInPictureController else { return }
-        startRetries = 0
         channel.invokeMethod("onModeChanged", arguments: ["isInPipMode": true])
         // 小窗真正 Active 时同步一次 Now Playing（rate/进度翻面），
         // 锁屏与控制中心卡片据此从"准备中/暂停"切回"在播"。
@@ -989,29 +1009,6 @@ final class IosPictureInPictureController: NSObject,
             if startRequested, !restoring {
                 startRequested = false
                 NSLog("SimpleLive PiP: startRequested released after failure (retry chain armed)")
-            }
-            // 冷却窗口应对：SpringBoard 在 PiP 停止后约 3-5s 内压制一切起窗
-            // （052807 实锤：判定全 YES 仍不发起，显式 start 也被 -1001 拒；
-            // 用户 5s/轮快测全败，隔 8s 成功；PiliPlus"100%"源于长观看节奏
-            // 远离冷却窗口）。失败后每秒重试，等窗口过期自动补起。
-            if failure.domain == AVKitErrorDomain, failure.code == -1001 {
-                startRetries += 1
-                let gen = sessionGeneration
-                let attempt = startRetries
-                if attempt <= 10 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                        guard let self = self, self.sessionGeneration == gen,
-                              self.enteredBackground,
-                              UIApplication.shared.applicationState == .background,
-                              !self.isPictureInPictureActive,
-                              self.isPictureInPicturePossible,
-                              self.hasEnqueuedFrame,
-                              !self.startRequested else { return }
-                        self.startRequested = true
-                        NSLog("SimpleLive PiP: background retry #\(attempt) after -1001")
-                        self.pip.startPictureInPicture()
-                    }
-                }
             }
             return
         }
