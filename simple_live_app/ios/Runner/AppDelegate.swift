@@ -2,6 +2,7 @@ import UIKit
 import Flutter
 import UserNotifications
 import AVFoundation
+import MediaPlayer
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
@@ -17,6 +18,7 @@ import AVFoundation
   ) -> Bool {
     UNUserNotificationCenter.current().delegate = self
     configureAudioSession()
+    setupNowPlaying()
     registerAudioObservers()
 
     if let controller = window?.rootViewController as? FlutterViewController {
@@ -86,6 +88,27 @@ import AVFoundation
       name: AVAudioSession.routeChangeNotification,
       object: nil
     )
+  }
+
+  // iOS 拒绝无 Now Playing 资格的后台 app 提交 Metal 命令
+  // (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted)。
+  // 注册遥控命令是资格判定条件之一；handler 仅占位，实际控制仍走 PiP 窗口。
+  private func setupNowPlaying() {
+    let center = MPNowPlayingInfoCenter.default()
+    var info = center.nowPlayingInfo ?? [String: Any]()
+    info[MPMediaItemPropertyTitle] = "SimpleLive"
+    info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
+    info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = 0.0
+    center.nowPlayingInfo = info
+    if #available(iOS 13.0, *) {
+      center.playbackState = .playing
+    }
+
+    let commandCenter = MPRemoteCommandCenter.shared()
+    commandCenter.playCommand.addTarget { _ in return .success }
+    commandCenter.pauseCommand.addTarget { _ in return .success }
+    commandCenter.togglePlayPauseCommand.addTarget { _ in return .success }
+    UIApplication.shared.beginReceivingRemoteControlEvents()
   }
 
   @objc private func handleInterruption(_ notification: Notification) {
