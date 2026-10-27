@@ -207,6 +207,12 @@ class LiveRoomController extends PlayerController
   @override
   String get playbackSubtitle => detail.value?.title ?? '';
 
+  @override
+  String get pipNowPlayingTitle => playbackTitle;
+
+  @override
+  String get pipNowPlayingArtist => playbackSubtitle;
+
   /// 直播间加载是否失败
   var loadError = false.obs;
   Object? error;
