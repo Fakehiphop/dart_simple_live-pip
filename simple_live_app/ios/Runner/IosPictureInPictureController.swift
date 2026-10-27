@@ -184,13 +184,16 @@ final class IosPictureInPictureController: NSObject,
         let timer = DispatchSource.makeTimerSource(queue: feedPumpQueue)
         timer.schedule(deadline: .now(), repeating: 1.0 / 30.0)
         timer.setEventHandler { [weak self] in
-            guard let self = self, self.activeFeed, let id = self.textureId else { return }
+            guard let self = self,
+                  self.activeFeed || (self.autoStartArmed && self.hasEnqueuedFrame),
+                  let id = self.textureId else { return }
             let scheduledAt = CACurrentMediaTime()
             DispatchQueue.main.async {
                 let hopDelay = CACurrentMediaTime() - scheduledAt
                 self.mainHopDelaySum += hopDelay
                 self.mainHopCount += 1
-                guard self.activeFeed, let buffer = self.copyPixelBuffer?(id) else { return }
+                guard self.activeFeed || (self.autoStartArmed && self.hasEnqueuedFrame),
+                      let buffer = self.copyPixelBuffer?(id) else { return }
                 self.onVideoFrame(buffer, textureId: id, force: true)
             }
         }
@@ -271,11 +274,22 @@ final class IosPictureInPictureController: NSObject,
         if !pip.isPictureInPictureActive, pip.isPictureInPicturePossible,
            pip.canStartPictureInPictureAutomaticallyFromInline || autoStartArmed {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                guard let self = self, self.enteredBackground,
-                      UIApplication.shared.applicationState == .background,
+                guard let self = self else { return }
+                let state = UIApplication.shared.applicationState
+                let pipActive = self.controller?.isPictureInPictureActive ?? false
+                let possible = self.controller?.isPictureInPicturePossible ?? false
+                guard self.enteredBackground, state == .background,
                       let pip = self.controller,
-                      !pip.isPictureInPictureActive, !self.startRequested,
-                      self.hasEnqueuedFrame, pip.isPictureInPicturePossible else { return }
+                      !pipActive, !self.startRequested,
+                      self.hasEnqueuedFrame, possible else {
+                    NSLog("SimpleLive PiP: fallback skipped: entered=%@ state=%ld active=%@ startReq=%@ hasFrame=%@ possible=%@",
+                          self.enteredBackground ? "true" : "false", state.rawValue,
+                          pipActive ? "true" : "false",
+                          self.startRequested ? "true" : "false",
+                          self.hasEnqueuedFrame ? "true" : "false",
+                          possible ? "true" : "false")
+                    return
+                }
                 self.startRequested = true
                 NSLog("SimpleLive PiP: background fallback startPictureInPicture issued (auto-start missed)")
                 pip.startPictureInPicture()
@@ -313,6 +327,18 @@ final class IosPictureInPictureController: NSObject,
     /// 帧到齐后重算一次即可，不需要 OFF→ON 反复重推。
     private func updateAutoEnterFlag() {
         controller?.canStartPictureInPictureAutomaticallyFromInline = autoStartArmed && hasEnqueuedFrame
+        syncFeedPump()
+    }
+
+    /// 喂帧泵在场条件统一入口：PiP 活跃，或已武装且有帧。武装窗口内保持
+    /// 30Hz 拉取，让退后台判定时刻图层始终有鲜活内容——自动启动成败与
+    /// 该时刻图层新鲜度强相关（真机实测：enq=24 成功 vs enq=11/4 失败）。
+    private func syncFeedPump() {
+        if activeFeed || (autoStartArmed && hasEnqueuedFrame && controller != nil) {
+            startFeedPump()
+        } else {
+            stopFeedPump()
+        }
     }
 
     /// 自动路径入口：只保证开关就绪，不调用 startPictureInPicture。
@@ -597,9 +623,9 @@ final class IosPictureInPictureController: NSObject,
             hasEnqueuedFrame = false
             layer.flush()
         }
-        if !force, feedPump != nil,
-           activeFeed || controller?.isPictureInPictureActive == true {
-            // 兜底泵在场时，通知驱动的拉取是重复劳动，静默跳过（不计 drop）。
+        if !force, feedPump != nil {
+            // 兜底泵在场时（PiP 活跃或武装窗口），通知驱动的拉取是重复劳动，
+            // 统一由泵按 30Hz 喂，静默跳过（不计 drop）。
             return
         }
         guard layer.isReadyForMoreMediaData else {
@@ -614,6 +640,14 @@ final class IosPictureInPictureController: NSObject,
         let pixelFormat = CVPixelBufferGetPixelFormatType(source)
         guard pixelFormat == kCVPixelFormatType_32BGRA || pixelFormat == kCVPixelFormatType_32ARGB
         else { droppedFrames += 1; return }
+
+        // renderSize 自愈：会话早于系统尺寸协商时（真机实测 render 0x0 卡
+        // 11 秒、manual entry 5s 超时），用首帧实际尺寸回填，布局与
+        // hasDisplayableFrame 据此恢复。
+        if renderSize.width == 0 || renderSize.height == 0 {
+            renderSize = CGSize(width: width, height: height)
+            layoutVideoView()
+        }
 
         // 采样节流：迟到的工作不追赶，跳过的帧零拷贝开销。
         // 兜底条件：isPictureInPictureActive 直接问系统，防止 activeFeed
@@ -645,31 +679,34 @@ final class IosPictureInPictureController: NSObject,
         let outWidth = max(1, Int((Double(width) * scale).rounded()))
         let outHeight = max(1, Int((Double(height) * scale).rounded()))
         let outSize = CGSize(width: outWidth, height: outHeight)
+        let bufferAttributes: [CFString: Any] = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey: outWidth, kCVPixelBufferHeightKey: outHeight,
+            kCVPixelBufferIOSurfacePropertiesKey: [:],
+            // AVKit 消费的缓冲要能被 CoreVideo/CoreImage 直接接管。
+            kCVPixelBufferMetalCompatibilityKey: true
+        ]
         if pixelBufferPool == nil || pixelBufferPoolSize != outSize {
             hasEnqueuedFrame = false
             layer.flushAndRemoveImage()
             pixelBufferPoolSize = outSize
             formatDescription = nil
             pixelBufferPool = nil
-            let attributes: [CFString: Any] = [
-                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey: outWidth, kCVPixelBufferHeightKey: outHeight,
-                kCVPixelBufferIOSurfacePropertiesKey: [:],
-                // AVKit 消费的缓冲要能被 CoreVideo/CoreImage 直接接管。
-                kCVPixelBufferMetalCompatibilityKey: true
-            ]
-            CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attributes as CFDictionary, &pixelBufferPool)
-        }
-        guard let pool = pixelBufferPool else {
-            droppedFrames += 1
-            dropPool += 1
-            return
+            CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, bufferAttributes as CFDictionary, &pixelBufferPool)
         }
         var destination: CVPixelBuffer?
-        let limits = [kCVPixelBufferPoolAllocationThresholdKey: 3] as CFDictionary
-        guard CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
-            kCFAllocatorDefault, pool, limits, &destination) == kCVReturnSuccess,
-              let buffer = destination else {
+        if let pool = pixelBufferPool {
+            let limits = [kCVPixelBufferPoolAllocationThresholdKey: 10] as CFDictionary
+            CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+                kCFAllocatorDefault, pool, limits, &destination)
+        }
+        if destination == nil {
+            // 池配额耗尽（缓冲全被渲染链持有）时散配一帧兜底，绝不因阈值
+            // 丢帧——真机实测 pool 桶 50% 丢帧=入场卡顿主因。
+            CVPixelBufferCreate(kCFAllocatorDefault, outWidth, outHeight,
+                                kCVPixelFormatType_32BGRA, bufferAttributes as CFDictionary, &destination)
+        }
+        guard let buffer = destination else {
             droppedFrames += 1
             dropPool += 1
             return
@@ -813,7 +850,7 @@ final class IosPictureInPictureController: NSObject,
         // 自动启动路径的过渡保护：立即通知 Dart 进入 PiP 模式
         // （同步定时器提前运行，绘制状态不再漂移）。
         activeFeed = true
-        startFeedPump()
+        syncFeedPump()
         // 小窗启动即重置图层解码管线：入场会话实测过图层内部队列不消费
         // （isReadyForMoreMediaData 长期 false，入队仅 ~11fps 抖动）；清掉
         // 入场前保温期积压的旧样本，让泵从空管线以 30Hz 重建画面。
@@ -839,7 +876,7 @@ final class IosPictureInPictureController: NSObject,
                                     failedToStartPictureInPictureWithError error: Error) {
         guard controller === pictureInPictureController else { return }
         activeFeed = false
-        stopFeedPump()
+        syncFeedPump()
         let failure = error as NSError
         var details = entryDiagnostics()
         details["domain"] = failure.domain
@@ -868,7 +905,7 @@ final class IosPictureInPictureController: NSObject,
         startRequested = false
         suspendOnStart = false
         activeFeed = false
-        stopFeedPump()
+        syncFeedPump()
         finishEntry(false)
     }
 
@@ -923,6 +960,12 @@ final class IosPictureInPictureController: NSObject,
         !playing
     }
 
+    func pictureInPictureControllerIsPlaybackBufferEmpty(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
+        // 不实现时 AVKit 自行探测缓冲，willStart 的 flush 重置后会被误判成
+        // "视频还没准备好"，小窗菜单的播放按钮随之失效；显式回报缓冲状态。
+        !hasEnqueuedFrame
+    }
+
     /// PiP 窗口尺寸变化 → 记下实际 renderSize（PiliPlus `didTransitionToRenderSize`）。
     /// 输出尺寸据此压缩，避免超采样；同时立刻补一帧让新窗口有画面。
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
@@ -931,7 +974,7 @@ final class IosPictureInPictureController: NSObject,
         lastEnqueueAt = 0
         layoutVideoView()
         if let id = textureId, let buffer = copyPixelBuffer?(id) {
-            onVideoFrame(buffer, textureId: id)
+            onVideoFrame(buffer, textureId: id, force: true)
         }
     }
 
