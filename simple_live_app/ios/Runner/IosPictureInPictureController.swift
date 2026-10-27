@@ -804,7 +804,13 @@ final class IosPictureInPictureController: NSObject,
     private func logFrameStats(now: Double) {
         guard now - lastStatsAt > 5.0 else { return }
         lastStatsAt = now
-        let renderer = videoView?.displayLayer.sampleBufferRenderer
+        let layer = videoView?.displayLayer
+        var rendererStatus = layer?.status.rawValue ?? -1
+        var requiresFlush = layer?.requiresFlushToResumeDecoding ?? false
+        if #available(iOS 17.0, *) {
+            rendererStatus = layer?.sampleBufferRenderer.status.rawValue ?? -1
+            requiresFlush = layer?.sampleBufferRenderer.requiresFlushToResumeDecoding ?? false
+        }
         let hopCount = mainHopCount
         let hopAvg = hopCount > 0 ? mainHopDelaySum / Double(hopCount) * 1000.0 : 0
         mainHopDelaySum = 0
@@ -813,9 +819,9 @@ final class IosPictureInPictureController: NSObject,
               sourceFrames, enqueuedFrames, droppedFrames, dropNotReady,
               droppedFrames - dropNotReady - dropPool, dropPool,
               renderSize.width, renderSize.height,
-              videoView?.displayLayer.status.rawValue ?? -1,
-              renderer?.status.rawValue ?? -1,
-              (renderer?.requiresFlushToResumeDecoding ?? false) ? 1 : 0,
+              layer?.status.rawValue ?? -1,
+              rendererStatus,
+              requiresFlush ? 1 : 0,
               hopAvg, hopCount)
     }
 
