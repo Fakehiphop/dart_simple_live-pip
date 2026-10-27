@@ -30,6 +30,7 @@ import 'package:simple_live_app/modules/settings/danmu_settings_page.dart';
 import 'package:simple_live_app/routes/app_navigation.dart';
 import 'package:simple_live_app/routes/route_path.dart';
 import 'package:simple_live_app/services/current_room_service.dart';
+import 'package:simple_live_app/services/ios_pip_helper.dart';
 import 'package:simple_live_app/services/db_service.dart';
 import 'package:simple_live_app/services/ios_audio_session_service.dart';
 import 'package:simple_live_app/services/follow_service.dart';
@@ -3921,10 +3922,8 @@ ${errorStackTrace ?? ""}''');
       isBackground = false;
       _resumePlaybackForWindowsMinimize();
       if (Platform.isIOS) {
-        // v5：会话常驻温热，回前台不停小窗以外的任何东西，
-        // 不解除武装也不释放会话（disarm 已为空操作），保证下一次
-        // 退后台系统标志直接拉起。
-        unawaited(disarmIosPipForBackground());
+        // PiliPlus 路线：回前台原生自动停小窗（didActivate），
+        // 会话保留，无需 Dart 侧干预。
       }
       if (_iosPausedInBackgroundFallback) {
         _iosPausedInBackgroundFallback = false;
@@ -3955,30 +3954,10 @@ ${errorStackTrace ?? ""}''');
     } else if (state == AppLifecycleState.inactive) {
       Log.d("应用短暂失焦:$state");
       unawaited(syncAutoPipOnLeave());
-      // iOS：趁仍在前台确认退后台画中画就绪（温热管线 + 系统自动启动开关）。
-      // 早武装已随开播完成，这里幂等确认一次并同步最新播放状态，
-      // v3 无渲染器切换。失焦也可能来自控制中心等误触发，
-      // 回前台时解除武装即可。
-      if (Platform.isIOS &&
-          AppSettingsController.instance.autoPipOnExit.value &&
-          liveStatus.value &&
-          !listenMode.value &&
-          player.state.playing) {
-        // v11：三步串行，修掉 v10 引入的竞态。v10 把 enterAuto 改为
-        // inactive 瞬间发出（unawaited 与 prepareIosPipForResign 并发），
-        // 但 enterIosPipForBackground 的闸门 iosPipActiveOrEntering 含
-        // _armFlight.isRunning——prepareIosPipForResign 的 ensurePrepared
-        // 先入单飞闸门，enterAuto 同一 tick 到达即被静默吞掉（v10 真机
-        // 日志 05:58:45：第二次 attach 跑了，startPictureInPicture issued
-        // 全程 0 条）。现在串行：先同步最新状态（幂等），完成后必然
-        // 已过单飞窗口，再发 enterAuto——总耗时一次 attach 往返，仍在
-        // systemGesture 失活窗口内（数十毫秒级）。防误弹仍由原生
-        // applicationState != .active 闸门承担。
-        unawaited(() async {
-          await prepareIosPipForResign();
-          await enterIosPipForBackground();
-        }());
-      }
+      // PiliPlus 路线：自动进入完全由原生的系统自动启动标志
+      // （canStartPictureInPictureAutomaticallyFromInline）承担，
+      // 该标志随开播武装，退后台瞬间由 AVKit 自己发起启动，
+      // Dart 侧在 inactive 阶段无事可做。
     }
   }
 
@@ -3992,37 +3971,12 @@ ${errorStackTrace ?? ""}''');
   /// （该职责已从 Video 的 pauseUponEnteringBackgroundMode 移交至此）。
   bool _iosPausedInBackgroundFallback = false;
 
-  /// iOS 退后台：优先依赖"已武装的系统自动启动"拉起画中画；
-  /// 未武装成功时才走完整进入流程兜底；均未进入且未开启"允许后台播放"
-  /// 时暂停，保持与原 media_kit 行为一致。
+  /// iOS 退后台（paused）：自动进入由原生系统自动启动标志完成
+  /// （开播武装，见 PlayerSystemMixin 中的武装调用）。
+  /// 这里只兜底：若小窗未激活且未开启"允许后台播放"，
+  /// 按原行为暂停，回前台恢复。
   Future<void> _handleIosBackgroundPip() async {
-    final wantAutoPip =
-        AppSettingsController.instance.autoPipOnExit.value &&
-            liveStatus.value &&
-            !listenMode.value &&
-            player.state.playing;
-    if (wantAutoPip) {
-      // 已武装（或进入中）：系统应在退后台瞬间自行拉起画中画，
-      // 这里只兜底——若延迟后仍未拉起则记录观察日志（不再显式进入）。
-      if (iosPipActiveOrEntering || iosPipAutoStartArmed) {
-        _iosPausedInBackgroundFallback = false;
-        _scheduleIosAutoPipFallbackStart();
-        return;
-      }
-      // 未武装：真机日志实证后台显式 startPictureInPicture 一律被系统
-      // 拒绝（AVKitErrorDomain -1001，场景态 Background 不允许硬闯），
-      // 完整进入流程在此必失败。v5 只补武装（前台来不及的竞态），
-      // 下一次退后台由系统标志直接拉起；本次拉不起则按原行为暂停。
-      _iosPausedInBackgroundFallback = false;
-      await armIosPipForBackground();
-      if (iosPipActiveOrEntering || iosPipAutoStartArmed) {
-        _scheduleIosAutoPipFallbackStart();
-        return;
-      }
-    }
-    // 进入中/已激活的画中画会话绝不能暂停播放器，否则小窗画面与声音冻结。
-    if (iosPipActiveOrEntering) {
-      _iosPausedInBackgroundFallback = false;
+    if (IosPipHelper.isActive) {
       return;
     }
     if (!_allowBackgroundPlayback && !listenMode.value && player.state.playing) {
@@ -4034,33 +3988,6 @@ ${errorStackTrace ?? ""}''');
         Log.d("iOS 退后台暂停失败: $e");
       }
     }
-  }
-
-  bool _iosAutoPipFallbackStartScheduled = false;
-
-  /// 兜底：系统自动启动未发生时稍后观察记录。v5 不再显式进入——
-  /// 后台显式 startPictureInPicture 被系统禁止（场景态 Background，
-  /// AVKitErrorDomain -1001），合法路径只剩系统标志与 inactive 阶段的
-  /// enterAuto（均已就位）。这里只留日志供诊断，会话保持温热会比较久。
-  void _scheduleIosAutoPipFallbackStart() {
-    if (_iosAutoPipFallbackStartScheduled) {
-      return;
-    }
-    _iosAutoPipFallbackStartScheduled = true;
-    Future.delayed(const Duration(milliseconds: 2500), () async {
-      _iosAutoPipFallbackStartScheduled = false;
-      if (iosPipActiveOrEntering) {
-        return;
-      }
-      if (!isBackground ||
-          !liveStatus.value ||
-          listenMode.value ||
-          !player.state.playing ||
-          isPlayerClosing) {
-        return;
-      }
-      Log.d("iOS PiP: 系统自动启动未发生（2.5s 观察，保持武装不硬闯）");
-    });
   }
 
   void _pausePlaybackForWindowsMinimize() {

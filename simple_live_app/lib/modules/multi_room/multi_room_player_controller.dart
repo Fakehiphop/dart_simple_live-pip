@@ -24,10 +24,26 @@ class MultiRoomPlayerController extends GetxController {
           : MPVLogLevel.error,
     ),
   );
-  late final VideoController videoController = VideoController(
-    player,
-    configuration: MpvOptionsService.videoControllerConfiguration(),
-  );
+  /// 视频控制器（PiliPlus 路线：1.2.5 API 无同步工厂，异步创建）。
+  final videoController = Rx<VideoController?>(null);
+
+  @override
+  void onInit() {
+    super.onInit();
+    unawaited(_ensureVideoController());
+    unawaited(MpvOptionsService.applyToPlayer(player));
+    unawaited(load());
+  }
+
+  Future<void> _ensureVideoController() async {
+    if (videoController.value != null) {
+      return;
+    }
+    videoController.value = await VideoController.create(
+      player,
+      configuration: MpvOptionsService.videoControllerConfiguration(),
+    );
+  }
 
   final detail = Rx<LiveRoomDetail?>(null);
   final loading = true.obs;
@@ -58,11 +74,7 @@ class MultiRoomPlayerController extends GetxController {
   }
 
   @override
-  void onInit() {
-    super.onInit();
-    unawaited(MpvOptionsService.applyToPlayer(player));
-    unawaited(load());
-  }
+
 
   Future<void> load() async {
     if (_disposed) {

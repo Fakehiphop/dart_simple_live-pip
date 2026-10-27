@@ -8,8 +8,6 @@ import AVFoundation
   private var audioChannel: FlutterMethodChannel?
   private var backgroundTasks: [Int: UIBackgroundTaskIdentifier] = [:]
   private var nextBackgroundTaskId = 1
-  private var pipController: NSObject?
-  private var pipPluginRegistry: PipPluginRegistry?
 
   override func application(
     _ application: UIApplication,
@@ -158,41 +156,17 @@ import AVFoundation
   // MARK: - Notifications
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
+    GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     if #available(iOS 15.0, *) {
-      // iOS 画中画：包装插件注册表截获 media-kit 的纹理帧，
-      // 并通过 media-kit 发布的渲染模式接口在画中画期间切软件输出。
-      let pip = IosPictureInPictureController(messenger: engineBridge.applicationRegistrar.messenger())
-      let registry = PipPluginRegistry(registry: engineBridge.pluginRegistry) {
-        [weak pip] buffer, textureId in
-        pip?.onVideoFrame(buffer, textureId: textureId)
+      // iOS 画中画（PiliPlus 路线）：被动帧泵 + AVSampleBufferDisplayLayer，
+      // 不切换渲染管线。原生实现见 PipPlugin.swift。
+      if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "PipPlugin") {
+        PipPlugin.register(with: registrar)
       }
-      pip.copyPixelBuffer = { [weak registry] textureId in
-        registry?.copyPixelBuffer(forTexture: textureId)
-      }
-      pip.useSoftwareRendering = { [weak registry] handle, completion in
-        guard let registry = registry else { completion(false); return }
-        registry.useSoftwareRendering(forHandle: handle, completion: completion)
-      }
-      pip.restoreRendering = { [weak registry] completion in
-        guard let registry = registry else { completion(); return }
-        registry.restoreRendering(completion: completion)
-      }
-      registry.videoOutputWillChange = { [weak pip] handle, completion in
-        guard let pip = pip else { completion(false); return }
-        pip.videoOutputWillChange(handle, completion: completion)
-      }
-      registry.videoOutputDidChange = { [weak pip] handle, waitForTexture, completion in
-        guard let pip = pip else { completion(false); return }
-        pip.videoOutputDidChange(handle, waitForTexture: waitForTexture, completion: completion)
-      }
-      pipController = pip
-      pipPluginRegistry = registry
-      GeneratedPluginRegistrant.register(with: registry)
     } else {
-      GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
       // iOS < 15 无画中画能力，Dart 侧按 unsupported 处理。
       let pipChannel = FlutterMethodChannel(
-        name: "simple_live/ios_pip",
+        name: "simple_live/pip",
         binaryMessenger: engineBridge.applicationRegistrar.messenger()
       )
       pipChannel.setMethodCallHandler { _, result in result(false) }

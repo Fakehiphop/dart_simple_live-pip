@@ -22,8 +22,7 @@ import 'package:simple_live_app/app/log.dart';
 import 'package:simple_live_app/app/mpv_exit_helper.dart';
 import 'package:simple_live_app/app/utils.dart';
 import 'package:simple_live_app/services/background_playback_service.dart';
-import 'package:simple_live_app/services/ios_pip_controller.dart';
-import 'package:simple_live_app/services/ios_pip_video_output_transition.dart';
+import 'package:simple_live_app/services/ios_pip_helper.dart';
 import 'package:simple_live_app/services/ios_video_output_size.dart';
 import 'package:simple_live_app/services/mpv_options_service.dart';
 import 'package:simple_live_core/simple_live_core.dart';
@@ -185,12 +184,9 @@ mixin PlayerMixin {
       return;
     }
     _playerInitialized = true;
-    // iOS 画中画需要 copy-back 硬解（解码帧回读到内存，软件输出才拿得到画面）。
-    // 必须在首次访问 videoController 之前确定。
-    if (Platform.isIOS) {
-      MpvOptionsService.iosPipCopyBackDecoder =
-          await IosPipController.isSupported();
-    }
+    // PiliPlus 路线（media_kit_video 1.2.5 API）：VideoController 异步创建，
+    // 必须在 Video widget / textureId 访问之前完成。
+    await _ensureVideoController();
     await MpvOptionsService.applyToPlayer(player);
     final nativePlayer = player.platform as NativePlayer;
     // 设置音频输出驱动
@@ -208,11 +204,20 @@ mixin PlayerMixin {
     }
   }
 
-  /// 视频控制器
-  late final videoController = VideoController(
-    player,
-    configuration: MpvOptionsService.videoControllerConfiguration(),
-  );
+  /// 视频控制器（PiliPlus 路线：1.2.5 API 无同步工厂，异步创建）。
+  /// 订阅方用 Obx 监听本 Rx，创建完成前 Video 区域显示占位。
+  final videoController = Rx<VideoController?>(null);
+
+  /// 幂等创建 VideoController（必须在访问 videoController.value 前完成）。
+  Future<void> _ensureVideoController() async {
+    if (videoController.value != null) {
+      return;
+    }
+    videoController.value = await VideoController.create(
+      player,
+      configuration: MpvOptionsService.videoControllerConfiguration(),
+    );
+  }
 }
 
 mixin PlayerStateMixin on PlayerMixin {
@@ -597,9 +602,8 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
 
   final pip = Floating();
   StreamSubscription<PiPStatus>? _pipSubscription;
-  IosPipVideoOutputTransition? _iosPipTransition;
-  IosPipController? _iosPip;
   Timer? _iosPipSyncTimer;
+  bool _iosPipAutoEnterArmed = false;
   bool _androidWindowChannelActive = false;
   int? _androidWindowHandlerToken;
   bool _mobileSystemUiApplied = false;
@@ -1569,250 +1573,114 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
       return;
     }
     if (Platform.isIOS) {
-      await _enterIosPip();
+      final result = await _enterIosPip(autoEnter: false);
+      switch (result) {
+        case IosPipEnterResult.entered:
+          break;
+        case IosPipEnterResult.unsupported:
+          SmartDialog.showToast("当前设备不支持画中画，需要 iOS 15 或更高版本");
+        case IosPipEnterResult.notReady:
+          SmartDialog.showToast("视频尚未准备好，请稍后重试");
+        case IosPipEnterResult.failed:
+          SmartDialog.showToast("进入画中画失败");
+      }
       return;
     }
     SmartDialog.showToast("当前平台暂不支持小窗播放");
   }
 
-  /// iOS 系统画中画：media-kit 帧经原生层渲染进系统小窗（sample-buffer 路线）。
-  /// 参考 Kazumi PR #2646 的实现移植。
-  Future<IosPipEntryResult> _enterIosPip({bool silent = false}) async {
-    if (!Platform.isIOS) {
-      return IosPipEntryResult.unsupported;
-    }
-    _ensureIosPipSession();
-    final pip = _iosPip;
-    if (pip == null) {
-      return IosPipEntryResult.failed;
-    }
-    if (pip.isActive) {
-      return IosPipEntryResult.entered;
-    }
-    final result = await pip.enter();
-    if (silent) {
-      return result;
-    }
-    switch (result) {
-      case IosPipEntryResult.entered:
-        break;
-      case IosPipEntryResult.unsupported:
-        SmartDialog.showToast("当前设备不支持画中画，需要 iOS 15 或更高版本");
-      case IosPipEntryResult.notReady:
-        SmartDialog.showToast("视频尚未准备好，请稍后重试");
-      case IosPipEntryResult.failed:
-        SmartDialog.showToast("进入画中画失败");
-    }
-    return result;
-  }
+  // ===== iOS 系统画中画（PiliPlus 路线）=====
+  // 原生实现见 ios/Runner/PipPlugin.swift：被动帧泵 + AVSampleBufferDisplayLayer，
+  // 不切换渲染管线、无早武装机器。退后台自动进入由原生
+  // canStartPictureInPictureAutomaticallyFromInline 在退后台瞬间完成。
 
-  /// 退后台时自动进入 iOS 画中画（生命周期触发，无 UI 提示）。
-  /// 返回是否成功进入；不该尝试时返回 null（调用方据此走原有的暂停逻辑）。
-  Future<bool?> autoEnterIosPipInBackground() async {
-    if (!Platform.isIOS || _playerClosing) {
-      return null;
-    }
-    if (iosInPipState.value) {
-      return null;
-    }
-    final pip = _iosPip;
-    if (pip != null && pip.keepPlaybackInBackground) {
-      // 手动进入流程仍在进行或会话已激活，交给它完成。
-      return null;
-    }
-    final result = await _enterIosPip(silent: true);
-    return result == IosPipEntryResult.entered;
-  }
-
-  /// iOS 画中画会话是否已激活或正在进入。
-  /// 进入期间绝对不能暂停播放器，否则小窗画面与声音冻结。
-  bool get iosPipActiveOrEntering {
-    if (!Platform.isIOS) {
-      return false;
-    }
-    if (iosInPipState.value) {
-      return true;
-    }
-    final pip = _iosPip;
-    return pip != null && pip.keepPlaybackInBackground;
-  }
-
-  /// 是否已预武装"退后台系统自动启动"。
-  bool get iosPipAutoStartArmed => _iosPipAutoStartArmed;
-  bool _iosPipAutoStartArmed = false;
-
-  /// iOS 画中画早武装：开播即建立会话并打开系统自动启动开关
-  /// （canStartPictureInPictureAutomaticallyFromInline）。自动启动的判定
-  /// 发生在退后台瞬间，武装不能压在那几百毫秒里。
-  /// v3：帧管线全程温热（未进小窗 4fps 保温），无重操作，随建随武装。
-  /// 幂等：会话已就绪时重复调用是空操作。
-  Future<void> armIosPipForBackground() async {
-    if (!Platform.isIOS || _playerClosing) {
+  /// 武装"退后台自动进入画中画"（开播即调，幂等）。
+  Future<void> _armIosPipForBackground() async {
+    if (_iosPipAutoEnterArmed || IosPipHelper.isActive) {
       return;
     }
-    if (iosPipActiveOrEntering || _iosPipAutoStartArmed) {
+    final textureId = videoController.value?.id.value;
+    if (textureId == null || textureId < 0) {
       return;
     }
-    _ensureIosPipSession();
-    final pip = _iosPip;
-    if (pip == null) {
-      return;
-    }
-    _iosPipAutoStartArmed = await pip.ensurePrepared();
-    Log.d(
-        'iOS PiP: 早武装${_iosPipAutoStartArmed ? '完成（系统自动启动已开启）' : '失败'}');
-  }
-
-  /// 退后台收尾（应用 inactive 阶段调用）。v3 无需切换软件渲染——
-  /// GPU 渲染管线全程恒定，帧镜像持续喂养；这里只同步一次最新状态。
-  Future<void> prepareIosPipForResign() async {
-    if (!Platform.isIOS || _playerClosing || !_iosPipAutoStartArmed) {
-      return;
-    }
-    if (iosPipActiveOrEntering) {
-      return;
-    }
-    final pip = _iosPip;
-    if (pip == null) {
-      return;
-    }
-    final ok = await pip.prepareForBackground();
-    Log.d('iOS PiP: 退后台收尾${ok ? '完成（状态已同步，管线温热）' : '失败'}');
-  }
-
-  /// inactive 阶段的显式启动（v4 核心兜底）：早武装后所有重活都已在前台
-  /// 完成，inactive 时刻系统只余一行 start 调用；配合退后台 1 秒原生
-  /// 兜底与后台 2.5 秒 Dart 兜底，共三路拉起保险。
-  Future<void> enterIosPipForBackground() async {
-    if (!Platform.isIOS || _playerClosing || !_iosPipAutoStartArmed) {
-      return;
-    }
-    if (iosPipActiveOrEntering) {
-      return;
-    }
-    final pip = _iosPip;
-    if (pip == null) {
-      return;
-    }
-    final issued = await pip.requestAutoEnter();
-    Log.d('iOS PiP: inactive 显式启动${issued ? '已发出' : '未发出（会话未就绪或已在进行）'}');
-  }
-
-  /// 解除武装（回前台）。v5 改为空操作：会话常驻温热（与 PiliPlus
-  /// 同一模式）——回前台只停小窗，会话/管线/自动启动标志全部保留，
-  /// 下一次退后台系统标志直接拉起（重建会话在后台必被拒 -1001）。
-  /// 页面关闭时 _disposeIosPip 仍会整段释放。
-  Future<void> disarmIosPipForBackground() async {
-    return;
-  }
-
-  /// 创建 iOS 画中画会话（与播放器同生命周期，离开页面时释放）。
-  void _ensureIosPipSession() {
-    if (!Platform.isIOS || _iosPip != null) {
-      return;
-    }
-    final transition = IosPipVideoOutputTransition(
-      resolveBinding: (expectedHandle) async {
-        final nativePlayer = player.platform;
-        if (nativePlayer is! NativePlayer) {
-          return null;
-        }
-        final handle = await player.handle;
-        if (handle != expectedHandle) {
-          return null;
-        }
-        return IosPipVideoOutputBinding(
-          handle: handle,
-          textureId: videoController.id,
-          isCurrent: () => !_playerClosing,
-          readVid: () => nativePlayer.getProperty('vid'),
-          writeVid: (value) => nativePlayer.setProperty('vid', value),
-        );
-      },
+    _iosPipAutoEnterArmed = true;
+    IosPipHelper.enter(
+      textureId,
+      width: player.state.width,
+      height: player.state.height,
+      autoEnter: true,
+      state: _iosPipState(),
     );
-    _iosPipTransition = transition;
-    _iosPip = IosPipController(
-      playbackState: () => IosPipPlaybackState(
-        textureId: videoController.id.value,
-        playing: player.state.playing,
-        position: player.state.position,
-        duration: player.state.duration,
-        rate: player.state.rate,
-        sourceRect: _iosPipSourceRect(),
-      ),
-      playerHandle: () async {
-        if (player.platform is! NativePlayer) {
-          return null;
-        }
-        return player.handle;
-      },
-      suspendVideo: transition.suspendVideo,
-      resumeVideo: transition.resumeVideo,
-      onPlay: () => player.play(),
-      onPause: () => player.pause(),
-      onSeek: (position) => player.seek(position),
-      onModeChanged: _handleIosPipModeChanged,
-      canRestore: () => !_playerClosing,
+    _ensureIosPipSyncTimer();
+    Log.d('iOS PiP: 已武装退后台自动进入');
+  }
+
+  /// 进入画中画（手动菜单入口；autoEnter=true 仅用于武装）。
+  Future<IosPipEnterResult> _enterIosPip({required bool autoEnter}) async {
+    if (!Platform.isIOS) {
+      return IosPipEnterResult.unsupported;
+    }
+    if (!IosPipHelper.isAvailable) {
+      return IosPipEnterResult.unsupported;
+    }
+    final textureId = videoController.value?.id.value;
+    if (textureId == null || textureId < 0) {
+      return IosPipEnterResult.notReady;
+    }
+    IosPipHelper.enter(
+      textureId,
+      width: player.state.width,
+      height: player.state.height,
+      autoEnter: autoEnter,
+      state: _iosPipState(),
     );
+    _ensureIosPipSyncTimer();
+    return IosPipEnterResult.entered;
   }
 
-  void _handleIosPipModeChanged(bool active, bool restored) {
-    iosInPipState.value = active;
-    // v5：不再在 PiP 停止时解除武装。武装状态表达的是设置项
-    // （退后台自动画中画），直播页存活期间恒成立；卸了武装的下一次
-    // 退后台只能靠后台重建会话硬闯，而那必然 -1001（场景态不允许）。
-    _iosPipSyncTimer?.cancel();
-    if (active) {
-      showControlsState.value = false;
-      // 定期把进度/播放状态同步给系统画中画窗口。
-      _iosPipSyncTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-        _iosPip?.synchronize();
-      });
-    }
-    // 关闭小窗后维持应用现有的后台音频行为，不主动暂停。
+  /// 当前推给原生小窗的播放状态。直播间恒为直播语义：无进度条、
+  /// 无 ±10s（mpv 对部分流会报有限时长，不能用 duration>0 反推，
+  /// 见 v5 复盘：PiP 小窗 UI 由上报的播放状态决定）。
+  Map<String, Object> _iosPipState() {
+    return {
+      'isPlaying': player.state.playing,
+      'isBuffering': player.state.buffering,
+      'isLive': true,
+      'position': player.state.position.inMilliseconds,
+      'duration': player.state.duration.inMilliseconds,
+      'speed': player.state.rate,
+    };
   }
 
-  /// 视频在窗口中的实际显示区域（逻辑坐标，UIKit points），
-  /// 用作原生画中画图层的内联位置。
-  Rect? _iosPipSourceRect() {
-    final context = globalPlayerKey.currentContext;
-    if (context == null) {
-      return null;
+  /// 周期性把最新状态推给原生（原生据此驱动小窗时间基与 UI）。
+  void _ensureIosPipSyncTimer() {
+    if (_iosPipSyncTimer != null) {
+      return;
     }
-    final renderObject = context.findRenderObject();
-    if (renderObject is! RenderBox || !renderObject.hasSize) {
-      return null;
-    }
-    final size = renderObject.size;
-    if (size.isEmpty) {
-      return null;
-    }
-    Rect rect = Offset.zero & size;
-    final videoWidth = player.state.width ?? 0;
-    final videoHeight = player.state.height ?? 0;
-    if (videoWidth > 0 && videoHeight > 0) {
-      final scale = math.min(rect.width / videoWidth, rect.height / videoHeight);
-      rect = Rect.fromCenter(
-        center: rect.center,
-        width: videoWidth * scale,
-        height: videoHeight * scale,
-      );
-    }
-    return MatrixUtils.transformRect(renderObject.getTransformTo(null), rect);
+    _iosPipSyncTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      if (_playerClosing || !Platform.isIOS) {
+        _iosPipSyncTimer?.cancel();
+        _iosPipSyncTimer = null;
+        return;
+      }
+      if (IosPipHelper.needsUpdate) {
+        IosPipHelper.update(_iosPipState());
+      }
+    });
   }
 
   Future<void> _disposeIosPip() async {
     _iosPipSyncTimer?.cancel();
     _iosPipSyncTimer = null;
-    // 原生 dispose 会排空进行中的输出切换并恢复 vid，
-    // 期间 onVideoOutputWillChange/DidChange 回调仍需到达 transition，
-    // 所以先释放会话、后释放 transition。
-    await _iosPip?.dispose();
-    _iosPip = null;
-    await _iosPipTransition?.dispose();
-    _iosPipTransition = null;
+    _iosPipAutoEnterArmed = false;
+    IosPipHelper.onActiveChanged = null;
+    IosPipHelper.onSetPlaying = null;
+    IosPipHelper.onSkip = null;
+    IosPipHelper.onClosedInBackground = null;
+    IosPipHelper.dispose();
   }
 }
+
 mixin PlayerGestureControlMixin
     on PlayerStateMixin, PlayerMixin, PlayerSystemMixin {
   /// 单击显示/隐藏控制器
@@ -2362,7 +2230,7 @@ class PlayerController extends BaseController
     if (!settings.iosOriginalQualityPowerSaving.value) {
       if (force || _iosVideoOutputSize != null) {
         try {
-          await videoController.setSize();
+          await videoController.value?.setSize();
           _iosVideoOutputSize = null;
           Log.d("iOS 原画省电优化已关闭，恢复源分辨率纹理");
         } catch (e) {
@@ -2397,9 +2265,9 @@ class PlayerController extends BaseController
       if (force && _iosVideoOutputSize != null) {
         // media_kit may restore the source-sized surface for a new VideoParams
         // event without updating its Dart-side fixed-size state.
-        await videoController.setSize();
+        await videoController.value?.setSize();
       }
-      await videoController.setSize(
+      await videoController.value?.setSize(
         width: target.width,
         height: target.height,
       );
@@ -2487,7 +2355,35 @@ class PlayerController extends BaseController
     });
   }
 
+  bool _iosPipCallbacksWired = false;
+
   void initStream() {
+    if (Platform.isIOS && !_iosPipCallbacksWired) {
+      _iosPipCallbacksWired = true;
+      unawaited(IosPipHelper.init());
+      IosPipHelper.onActiveChanged = (active) {
+        iosInPipState.value = active;
+        if (active) {
+          showControlsState.value = false;
+        }
+      };
+      IosPipHelper.onSetPlaying = (playing) {
+        playing ? unawaited(player.play()) : unawaited(player.pause());
+      };
+      IosPipHelper.onSkip = (offset) {
+        // 直播语义下原生不会展示快进按钮；仅点播语义会触发。
+        unawaited(player.seek(player.state.position + offset));
+      };
+      IosPipHelper.onClosedInBackground = () {
+        // 后台关闭小窗：与 Android 行为一致暂停播放；
+        // 听直播 / 允许后台播放模式不干预。
+        if (!_playerClosing &&
+            !listenModeEnabled &&
+            !AppSettingsController.instance.allowBackgroundPlayback.value) {
+          unawaited(player.pause());
+        }
+      };
+    }
     if (Platform.isIOS) {
       _iosOriginalQualityPowerSavingWorker = ever<bool>(
         AppSettingsController.instance.iosOriginalQualityPowerSaving,
@@ -2539,11 +2435,13 @@ class PlayerController extends BaseController
         unawaited(_syncBackgroundPlayback());
         Log.d("Playing");
         refreshIosVideoOutputLimit(force: true);
-        // iOS 早武装：开播即建立画中画会话并打开系统自动启动开关。
-        // 自动启动的判定窗口在上滑/退桌面的瞬间，会话必须早于情绪时刻就绪。
-        if (!listenModeEnabled &&
+        // iOS：开播即武装"退后台自动进入画中画"（幂等）。真正的自动启动
+        // 由原生 canStartPictureInPictureAutomaticallyFromInline 在退后台
+        // 瞬间完成，这里只需保证武装早于该时刻。
+        if (Platform.isIOS &&
+            !listenModeEnabled &&
             AppSettingsController.instance.autoPipOnExit.value) {
-          unawaited(armIosPipForBackground());
+          unawaited(_armIosPipForBackground());
         }
         // 只有持续播放一段时间才清零，避免坏流在每次重开后立刻绕过上限。
         _scheduleStablePlaybackReset(generation);
@@ -3288,8 +3186,7 @@ class PlayerController extends BaseController
       return;
     }
     _playerClosing = true;
-    // 先释放 iOS 画中画：原生 dispose 需要排空输出切换回调，
-    // 这些回调会访问仍在运行的播放器。
+    // 释放 iOS 画中画（PiliPlus 路线：取消同步定时器并 dispose 原生会话）。
     await _disposeIosPip();
     _cancelStablePlaybackTimer();
     clearTransientPlayerOverlays();

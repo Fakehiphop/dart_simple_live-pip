@@ -9,11 +9,6 @@ import 'package:simple_live_app/app/controller/app_settings_controller.dart';
 import 'package:simple_live_app/app/log.dart';
 
 class MpvOptionsService {
-  /// iOS 画中画期间输出要切到软件渲染，硬解必须用 -copy 回读模式，
-  /// 否则解码帧留在 GPU，软件输出拿不到画面。
-  /// 由播放器初始化时按画中画可用性设置（见 PlayerMixin.initializePlayer），
-  /// 必须在创建 VideoController 之前生效。
-  static bool iosPipCopyBackDecoder = false;
 
   static const Map<String, String> profileLabels = {
     "performance": "流畅",
@@ -122,7 +117,7 @@ class MpvOptionsService {
     final options = effectiveOptions.options;
     if (!Platform.isAndroid) {
       return VideoControllerConfiguration(
-        hwdec: _iosPipCopyBackHwdec(_desktopVideoControllerHwdec(effectiveOptions)),
+        hwdec: _desktopVideoControllerHwdec(effectiveOptions),
         enableHardwareAcceleration: settings.hardwareDecode.value,
       );
     }
@@ -211,24 +206,7 @@ class MpvOptionsService {
     return options.options["hwdec"];
   }
 
-  /// iOS 画中画可用时把硬解映射到 copy-back 变体（与 Kazumi 的映射一致）。
-  static String? _iosPipCopyBackHwdec(String? hwdec) {
-    if (!Platform.isIOS || !iosPipCopyBackDecoder) {
-      return hwdec;
-    }
-    switch (hwdec) {
-      case 'auto':
-        return 'auto-copy';
-      case 'auto-safe':
-        return 'auto-copy-safe';
-      case 'videotoolbox':
-        return 'videotoolbox-copy';
-      default:
-        return hwdec;
-    }
-  }
-
-  static String diagnosticsSummary() {
+    static String diagnosticsSummary() {
     final effectiveOptions = effectiveOptionsWithSource();
     final options = effectiveOptions.options;
     String value(String key) {
