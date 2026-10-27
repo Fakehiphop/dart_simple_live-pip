@@ -143,10 +143,7 @@ class MpvOptionsService {
   };
 
   static Future<void> applyToPlayer(Player player) async {
-    if (player.platform is! NativePlayer) {
-      return;
-    }
-    final nativePlayer = player.platform as dynamic;
+    // PiliPlus 路线：Player 即 NativePlayer（typedef），setProperty 同步调用。
     // iOS 的视频管线固定，只应用网络默认参数；audio-exclusive 使 mpv 不使用
     // MixWithOthers，与 AppDelegate 的 .playback 类别保持一致。
     if (Platform.isIOS) {
@@ -156,7 +153,7 @@ class MpvOptionsService {
       };
       for (final entry in iosOptions.entries) {
         try {
-          await nativePlayer.setProperty(entry.key, entry.value);
+          player.setProperty(entry.key, entry.value);
         } catch (e) {
           Log.d("mpv ios option skipped: ${entry.key}=${entry.value} $e");
         }
@@ -169,7 +166,7 @@ class MpvOptionsService {
       ..remove("hwdec");
     for (final entry in options.entries) {
       try {
-        await nativePlayer.setProperty(entry.key, entry.value);
+        player.setProperty(entry.key, entry.value);
       } catch (e) {
         Log.d("mpv option skipped: ${entry.key}=${entry.value} $e");
       }

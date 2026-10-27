@@ -2108,6 +2108,8 @@ class LiveRoomController extends PlayerController
       finalUrl = finalUrl.replaceAll("http://", "https://");
     }
 
+    // fork 的 Player 需异步创建，读取状态前先确保已创建。
+    await ensurePlayer();
     final previousWidth = player.state.width;
     final previousHeight = player.state.height;
     final wasPlaying = player.state.playing;
@@ -2131,10 +2133,8 @@ class LiveRoomController extends PlayerController
     }
 
     final opened = await openPlaybackMedia(
-      Media(
-        finalUrl,
-        httpHeaders: playHeaders,
-      ),
+      Media(finalUrl),
+      headers: playHeaders,
       loadGeneration: loadGeneration,
       mediaGeneration: mediaGeneration,
     );

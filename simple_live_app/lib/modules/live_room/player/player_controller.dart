@@ -165,18 +165,31 @@ const int _kDanmakuReplayLimit = 300;
 
 mixin PlayerMixin {
   bool _playerInitialized = false;
+
+  /// 当前媒体的 HTTP 请求头（fork 的 Media 不携带 headers，open 前注入）。
+  Map<String, String>? _lastPlaybackHeaders;
   GlobalKey<VideoState> globalPlayerKey = GlobalKey<VideoState>();
   GlobalKey globalDanmuKey = GlobalKey();
 
-  /// 播放器实例
-  late final player = Player(
-    configuration: PlayerConfiguration(
-      title: "Simple Live Player",
-      logLevel: AppSettingsController.instance.logEnable.value
-          ? MPVLogLevel.info
-          : MPVLogLevel.error,
-    ),
-  );
+  /// 播放器实例（PiliPlus 路线：fork 的 Player 无同步构造器，异步创建）。
+  late Player player;
+  bool _playerCreated = false;
+
+  /// 幂等创建播放器（必须在任何 player 访问之前调用）。
+  Future<void> ensurePlayer() async {
+    if (_playerCreated) {
+      return;
+    }
+    _playerCreated = true;
+    player = await Player.create(
+      configuration: PlayerConfiguration(
+        title: "Simple Live Player",
+        logLevel: AppSettingsController.instance.logEnable.value
+            ? MPVLogLevel.info
+            : MPVLogLevel.error,
+      ),
+    );
+  }
 
   /// 初始化播放器并设置静态 mpv 参数。
   Future<void> initializePlayer() async {
@@ -184,23 +197,22 @@ mixin PlayerMixin {
       return;
     }
     _playerInitialized = true;
+    // fork 的 Player 需异步创建（PiliPlus 路线），必须在一切访问之前。
+    await ensurePlayer();
     // PiliPlus 路线（media_kit_video 1.2.5 API）：VideoController 异步创建，
     // 必须在 Video widget / textureId 访问之前完成。
     await _ensureVideoController();
     await MpvOptionsService.applyToPlayer(player);
-    final nativePlayer = player.platform as NativePlayer;
-    // 设置音频输出驱动
+    // 设置音频输出驱动（fork 的 setProperty 为同步调用）
     if (AppSettingsController.instance.customPlayerOutput.value) {
-      if (player.platform is NativePlayer) {
-        await (player.platform as dynamic).setProperty(
-          'ao',
-          AppSettingsController.instance.audioOutputDriver.value,
-        );
-      }
+      player.setProperty(
+        'ao',
+        AppSettingsController.instance.audioOutputDriver.value,
+      );
     }
     // media_kit 仓库更新导致的问题，临时解决办法
     if (Platform.isAndroid) {
-      await nativePlayer.setProperty('force-seekable', 'yes');
+      player.setProperty('force-seekable', 'yes');
     }
   }
 
@@ -2047,6 +2059,7 @@ class PlayerController extends BaseController
     required int loadGeneration,
     required int mediaGeneration,
     bool Function()? isStillOwner,
+    Map<String, String>? headers,
   }) async {
     while (true) {
       if (!_isPlaybackOwnerCurrent(
@@ -2084,6 +2097,14 @@ class PlayerController extends BaseController
     }
     _surfaceRecoveryGraceUntil =
         DateTime.now().add(_surfaceRecoveryGraceDuration);
+    // fork 的 Media 不再携带 httpHeaders，改用 setMediaHeader 在 open 前
+    // 注入；重开场景（无 headers 入参）复用上次请求头。
+    if (headers != null) {
+      _lastPlaybackHeaders = headers;
+    }
+    if (_lastPlaybackHeaders != null) {
+      player.setMediaHeader(headers: _lastPlaybackHeaders);
+    }
     final opening = Future<void>.microtask(() => player.open(media));
     _playbackOpenFuture = opening;
     try {
@@ -2679,13 +2700,13 @@ class PlayerController extends BaseController
   // Fix Issue #57 & #97: 处理异常的视频尺寸（Surface失效）。
   // Recovery is bounded and serialized so startup events cannot storm the decoder.
   Future<int?> readVideoOutputDropCount() async {
-    if (!Platform.isAndroid || player.platform is! NativePlayer) {
+    if (!Platform.isAndroid) {
       return null;
     }
     try {
-      final value = await (player.platform as NativePlayer)
-          .getProperty('frame-drop-count');
-      return int.tryParse(value.trim());
+      // fork 的 getProperty 为同步调用，直接返回 String。
+      final value = player.getProperty('frame-drop-count').trim();
+      return int.tryParse(value);
     } catch (e) {
       Log.d("读取 mpv 输出丢帧数失败: $e", false);
       return null;
@@ -3103,11 +3124,7 @@ class PlayerController extends BaseController
   }
 
   Future<Map<String, String>> _readMpvDiagnosticProperties() async {
-    final platform = player.platform;
-    if (platform is! NativePlayer) {
-      return const {};
-    }
-
+    // fork 的 Player 即 NativePlayer，getProperty 为同步调用。
     final result = <String, String>{};
     for (final name in const [
       'hwdec-current',
@@ -3117,7 +3134,7 @@ class PlayerController extends BaseController
       'video-bitrate',
     ]) {
       try {
-        final value = (await platform.getProperty(name)).trim();
+        final value = player.getProperty(name).trim();
         if (value.isNotEmpty) {
           result[name] = value;
         }

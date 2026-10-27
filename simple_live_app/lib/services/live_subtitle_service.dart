@@ -480,23 +480,22 @@ class _DesktopLiveSubtitleEngine {
 
     _createRecognizer();
 
-    _decoder = Player(
+    _decoder = await Player.create(
       configuration: const PlayerConfiguration(
         title: "Simple Live Subtitle Decoder",
         logLevel: MPVLogLevel.error,
       ),
     );
-    final platform = _decoder!.platform;
-    if (platform is NativePlayer) {
-      await platform.setProperty("vo", "null");
-      await platform.setProperty("ao", "pcm");
-      await platform.setProperty("ao-pcm-file", _pcmFile!.path);
-      await platform.setProperty("audio-samplerate", "$_sampleRate");
-      await platform.setProperty("audio-channels", "mono");
-      await platform.setProperty("audio-format", "s16");
-    }
-    await _decoder!.open(
-      Media(mediaUrl, httpHeaders: httpHeaders),
+    final decoder = _decoder!;
+    decoder.setProperty("vo", "null");
+    decoder.setProperty("ao", "pcm");
+    decoder.setProperty("ao-pcm-file", _pcmFile!.path);
+    decoder.setProperty("audio-samplerate", "$_sampleRate");
+    decoder.setProperty("audio-channels", "mono");
+    decoder.setProperty("audio-format", "s16");
+    decoder.setMediaHeader(headers: httpHeaders);
+    await decoder.open(
+      Media(mediaUrl),
       play: true,
     );
 
