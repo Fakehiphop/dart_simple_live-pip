@@ -75,6 +75,12 @@ final class IosPictureInPictureController: NSObject,
     // 锁屏/控制中心卡片的 Now Playing 封面：定期取一帧缩放后的缓冲。
     private var lastArtworkBuffer: CVPixelBuffer?
     private var lastArtworkAt = 0.0
+    // 锁屏卡片标题：主播名 + 直播间标题，Dart 推送。
+    private var nowPlayingTitle = "SimpleLive"
+    private var nowPlayingArtist = ""
+    // 喂帧兜底泵：小窗期间即使 mpv 推送变稀也按 30Hz 主动拉帧。
+    private var feedPump: DispatchSourceTimer?
+    private let feedPumpQueue = DispatchQueue(label: "SimpleLive.PiP.feedPump")
 
     init(messenger: FlutterBinaryMessenger) {
         channel = FlutterMethodChannel(name: "simple_live/ios_pip", binaryMessenger: messenger)
@@ -104,6 +110,9 @@ final class IosPictureInPictureController: NSObject,
                 self.armAutoStartIfReady(result)
             case "setAutoStartEnabled":
                 self.setAutoStartEnabled(args["enabled"] as? Bool == true, result: result)
+            case "updateInfo":
+                self.updateNowPlayingInfo(args)
+                result(nil)
             case "dispose":
                 self.finishEntry(false)
                 self.controller?.stopPictureInPicture()
@@ -154,11 +163,53 @@ final class IosPictureInPictureController: NSObject,
         channel.invokeMethod("onAction", arguments: ["action": play ? "play" : "pause"])
     }
 
+    /// 锁屏卡片标题（主播名 + 直播间标题），Dart 在武装/房间信息就绪时推送。
+    private func updateNowPlayingInfo(_ args: [String: Any]) {
+        if let title = args["title"] as? String, !title.isEmpty {
+            nowPlayingTitle = title
+        }
+        if let artist = args["artist"] as? String {
+            nowPlayingArtist = artist
+        }
+        refreshNowPlayingInfo()
+    }
+
+    /// 喂帧兜底泵：对照实验里 mpv→textureFrameAvailable 推送链在后台实测
+    /// 只有 ~4fps（PiliPlus 无泵且注释称"帧距由 mpv 决定"，其小窗流畅，
+    /// 说明推送速率受环境影响）。泵按 30Hz 主动拉最新纹理帧，force 绕过
+    /// 采样节流；内容未更新时拷到的是重复帧，无副作用。
+    private func startFeedPump() {
+        guard feedPump == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: feedPumpQueue)
+        timer.schedule(deadline: .now(), repeating: 1.0 / 30.0)
+        timer.setEventHandler { [weak self] in
+            guard let self = self, self.activeFeed, let id = self.textureId else { return }
+            DispatchQueue.main.async {
+                guard self.activeFeed, let buffer = self.copyPixelBuffer?(id) else { return }
+                self.onVideoFrame(buffer, textureId: id, force: true)
+            }
+        }
+        timer.resume()
+        feedPump = timer
+        NSLog("SimpleLive PiP: feed pump started (30Hz)")
+    }
+
+    private func stopFeedPump() {
+        guard feedPump != nil else { return }
+        feedPump?.cancel()
+        feedPump = nil
+        NSLog("SimpleLive PiP: feed pump stopped")
+    }
+
     /// Now Playing 速率/进度跟随：控制中心卡片据此显示"在播"状态；
     /// mediaserverd 的资格评估同样参考（rate=0 视为未播放）。
     private func refreshNowPlayingInfo() {
         var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [String: Any]()
         info[MPNowPlayingInfoPropertyPlaybackRate] = NSNumber(value: playing ? lastRate : 0.0)
+        info[MPMediaItemPropertyTitle] = nowPlayingTitle
+        if !nowPlayingArtist.isEmpty {
+            info[MPMediaItemPropertyArtist] = nowPlayingArtist
+        }
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] =
             NSNumber(value: timebase.map { CMTimeGetSeconds(CMTimebaseGetTime($0)) } ?? 0)
         if let artworkBuffer = lastArtworkBuffer {
@@ -537,6 +588,7 @@ final class IosPictureInPictureController: NSObject,
         startRequested = false
         suspendOnStart = false
         activeFeed = false
+        stopFeedPump()
         enteredBackground = false
         stopRequested = false
         lastEnqueueAt = 0
@@ -550,7 +602,7 @@ final class IosPictureInPictureController: NSObject,
         completion()
     }
 
-    func onVideoFrame(_ source: CVPixelBuffer, textureId: Int64) {
+    func onVideoFrame(_ source: CVPixelBuffer, textureId: Int64, force: Bool = false) {
         guard self.textureId == textureId, let layer = videoView?.displayLayer else { return }
         if layer.status == .failed {
             hasEnqueuedFrame = false
@@ -566,11 +618,16 @@ final class IosPictureInPictureController: NSObject,
         else { droppedFrames += 1; return }
 
         // 采样节流：迟到的工作不追赶，跳过的帧零拷贝开销。
+        // 兜底条件：isPictureInPictureActive 直接问系统，防止 activeFeed
+        // 因任何时序漏置而把小窗采样压回 0.25s 保温档（实测 4fps 卡顿）。
         let now = CACurrentMediaTime()
-        let interval = (activeFeed || entryResult != nil)
+        let pipActive = activeFeed
+            || controller?.isPictureInPictureActive == true
+            || (autoStartArmed && enteredBackground)
+        let interval = (pipActive || entryResult != nil)
             ? IosPictureInPictureController.activeFrameInterval
             : IosPictureInPictureController.idleFrameInterval
-        if lastEnqueueAt > 0, now - lastEnqueueAt < interval {
+        if !force, lastEnqueueAt > 0, now - lastEnqueueAt < interval {
             droppedFrames += 1
             logFrameStats(now: now)
             return
@@ -740,6 +797,7 @@ final class IosPictureInPictureController: NSObject,
         // 自动启动路径的过渡保护：立即通知 Dart 进入 PiP 模式
         // （同步定时器提前运行，绘制状态不再漂移）。
         activeFeed = true
+        startFeedPump()
         refreshNowPlayingInfo()
         NSLog("SimpleLive PiP: will start (%@)",
               suspendOnStart ? "manual + suspend" : "auto")
@@ -757,6 +815,7 @@ final class IosPictureInPictureController: NSObject,
                                     failedToStartPictureInPictureWithError error: Error) {
         guard controller === pictureInPictureController else { return }
         activeFeed = false
+        stopFeedPump()
         let failure = error as NSError
         var details = entryDiagnostics()
         details["domain"] = failure.domain
@@ -785,6 +844,7 @@ final class IosPictureInPictureController: NSObject,
         startRequested = false
         suspendOnStart = false
         activeFeed = false
+        stopFeedPump()
         finishEntry(false)
     }
 
