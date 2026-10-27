@@ -230,7 +230,9 @@ class IosPipController {
   }
 
   Future<void> synchronize() async {
-    if (!keepPlaybackInBackground || !_bridge.ownsNative(this)) return;
+    // 同样放宽到 _ownsPage：前台锁屏暂停后，锁屏卡片上的播放速率/进度
+    // 也要跟着翻面，不能等下次进小窗才同步。
+    if (!_ownsPage || !_bridge.ownsNative(this)) return;
     try {
       await _channel.invokeMethod<void>(
         'updatePlaybackState',
@@ -256,7 +258,10 @@ class IosPipController {
       case 'onRestore':
         return _ownsPage && canRestore();
       case 'onAction':
-        if (!keepPlaybackInBackground) return null;
+        // 锁屏/控制中心遥控：只要会话仍归属当前页面就接受。此前只在 PiP
+        // 激活/进入飞行中放行，导致"前台直接锁屏（未进小窗）"时遥控被吞。
+        // Now Playing 卡片按注册方路由，命令到达即本应用的卡片在显示。
+        if (!_ownsPage) return null;
         switch (args['action']) {
           case 'play':
             await onPlay();
