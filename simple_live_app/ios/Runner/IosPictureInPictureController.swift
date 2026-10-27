@@ -3,6 +3,7 @@ import Accelerate
 import Flutter
 import UIKit
 import MediaPlayer
+import CoreImage
 
 // PiliPlus 同构实现（本轮重写）：
 //   1. 只用一个自动启动机制：`canStartPictureInPictureAutomaticallyFromInline`
