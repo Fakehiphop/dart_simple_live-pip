@@ -23,7 +23,6 @@ import 'package:simple_live_app/app/mpv_exit_helper.dart';
 import 'package:simple_live_app/app/utils.dart';
 import 'package:simple_live_app/services/background_playback_service.dart';
 import 'package:simple_live_app/services/ios_pip_controller.dart';
-import 'package:simple_live_app/services/ios_pip_video_output_transition.dart';
 import 'package:simple_live_app/services/ios_video_output_size.dart';
 import 'package:simple_live_app/services/mpv_options_service.dart';
 import 'package:simple_live_core/simple_live_core.dart';
@@ -597,7 +596,6 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
 
   final pip = Floating();
   StreamSubscription<PiPStatus>? _pipSubscription;
-  IosPipVideoOutputTransition? _iosPipTransition;
   IosPipController? _iosPip;
   Timer? _iosPipSyncTimer;
   bool _androidWindowChannelActive = false;
@@ -1663,8 +1661,9 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
         'iOS PiP: 早武装${_iosPipAutoStartArmed ? '完成（系统自动启动已开启）' : '失败'}');
   }
 
-  /// 退后台收尾（应用 inactive 阶段调用）。v3 无需切换软件渲染——
-  /// GPU 渲染管线全程恒定，帧镜像持续喂养；这里只同步一次最新状态。
+  /// 退后台收尾（应用 inactive 阶段调用）：只同步一次最新播放状态，让原生
+  /// 侧 `canStartPictureInPictureAutomaticallyFromInline` 的判定有新鲜帧与正确时基。
+  /// 渲染后端全程恒定，无渲染器切换。
   Future<void> prepareIosPipForResign() async {
     if (!Platform.isIOS || _playerClosing || !_iosPipAutoStartArmed) {
       return;
@@ -1680,9 +1679,9 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     Log.d('iOS PiP: 退后台收尾${ok ? '完成（状态已同步，管线温热）' : '失败'}');
   }
 
-  /// inactive 阶段的显式启动（v4 核心兜底）：早武装后所有重活都已在前台
-  /// 完成，inactive 时刻系统只余一行 start 调用；配合退后台 1 秒原生
-  /// 兜底与后台 2.5 秒 Dart 兜底，共三路拉起保险。
+  /// 武装确认（inactive/paused 阶段调用）：只保证原生侧已武装并且标志为真，
+  /// 起窗由 SpringBoard 在退后台瞬间完成——显式 start 在后台一律 -1001，
+  /// 在这里不做。
   Future<void> enterIosPipForBackground() async {
     if (!Platform.isIOS || _playerClosing || !_iosPipAutoStartArmed) {
       return;
@@ -1694,8 +1693,8 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     if (pip == null) {
       return;
     }
-    final issued = await pip.requestAutoEnter();
-    Log.d('iOS PiP: inactive 显式启动${issued ? '已发出' : '未发出（会话未就绪或已在进行）'}');
+    final armed = await pip.requestAutoEnter();
+    Log.d('iOS PiP: 武装确认${armed ? '已就绪（等系统起窗）' : '未就绪'}');
   }
 
   /// 解除武装（回前台）。v5 改为空操作：会话常驻温热（与 PiliPlus
@@ -1711,26 +1710,6 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     if (!Platform.isIOS || _iosPip != null) {
       return;
     }
-    final transition = IosPipVideoOutputTransition(
-      resolveBinding: (expectedHandle) async {
-        final nativePlayer = player.platform;
-        if (nativePlayer is! NativePlayer) {
-          return null;
-        }
-        final handle = await player.handle;
-        if (handle != expectedHandle) {
-          return null;
-        }
-        return IosPipVideoOutputBinding(
-          handle: handle,
-          textureId: videoController.id,
-          isCurrent: () => !_playerClosing,
-          readVid: () => nativePlayer.getProperty('vid'),
-          writeVid: (value) => nativePlayer.setProperty('vid', value),
-        );
-      },
-    );
-    _iosPipTransition = transition;
     _iosPip = IosPipController(
       playbackState: () => IosPipPlaybackState(
         textureId: videoController.id.value,
@@ -1746,8 +1725,6 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
         }
         return player.handle;
       },
-      suspendVideo: transition.suspendVideo,
-      resumeVideo: transition.resumeVideo,
       onPlay: () => player.play(),
       onPause: () => player.pause(),
       onSeek: (position) => player.seek(position),
@@ -1804,13 +1781,8 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
   Future<void> _disposeIosPip() async {
     _iosPipSyncTimer?.cancel();
     _iosPipSyncTimer = null;
-    // 原生 dispose 会排空进行中的输出切换并恢复 vid，
-    // 期间 onVideoOutputWillChange/DidChange 回调仍需到达 transition，
-    // 所以先释放会话、后释放 transition。
     await _iosPip?.dispose();
     _iosPip = null;
-    await _iosPipTransition?.dispose();
-    _iosPipTransition = null;
   }
 }
 mixin PlayerGestureControlMixin
