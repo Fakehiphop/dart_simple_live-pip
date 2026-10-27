@@ -126,9 +126,12 @@ final class IosPictureInPictureController: NSObject,
                 self.updateNowPlayingInfo(args)
                 result(nil)
             case "dispose":
+                // 换直播间/离开直播页不再销毁会话：SpringBoard 只对已注册的
+                // Pegasus remote object 做自动起窗，每次重建 controller 都让
+                // 下一轮上滑变成"新对象赌博"。只重置帧管线状态。
                 self.finishEntry(false)
-                self.controller?.stopPictureInPicture()
-                self.cleanUp { result(nil) }
+                self.softReset()
+                result(nil)
             default:
                 result(FlutterMethodNotImplemented)
             }
@@ -588,6 +591,44 @@ final class IosPictureInPictureController: NSObject,
         if let error = error { result?(error) } else { result?(entered) }
     }
 
+    /// 会话离场常驻（c1 897fe9d8）：SpringBoard 只对"已预热"的 remote
+    /// object 发起自动起窗；销毁重建 = 每轮上滑都是新对象。保留
+    /// controller/displayLayer/contentSource/timebase，只重置帧管线状态；
+    /// 同一直播间重新 attach 时 textureId 与渲染尺寸天然吻合。
+    private func softReset() {
+        sessionGeneration += 1
+        clearEntryObservations()
+        hasEnqueuedFrame = false
+        autoStartArmed = false
+        updateAutoEnterFlag()
+        videoView?.displayLayer.flushAndRemoveImage()
+        renderSize = .zero
+        pixelBufferPool = nil
+        pixelBufferPoolSize = .zero
+        formatDescription = nil
+        startRequested = false
+        suspendOnStart = false
+        activeFeed = false
+        stopFeedPump()
+        stopRequested = false
+        enteredBackground = false
+        restoring = false
+        lastEnqueueAt = 0
+        enqueuedFrames = 0
+        sourceFrames = 0
+        droppedFrames = 0
+        dropNotReady = 0
+        dropPool = 0
+        mainHopDelaySum = 0
+        mainHopCount = 0
+        lastStatsAt = 0
+        lastArtworkBuffer = nil
+        lastArtworkRequested = false
+        lastNowPlayingPlaying = false
+        lastNowPlayingSynced = false
+        NSLog("SimpleLive PiP: soft reset (session kept across rooms)")
+    }
+
     private func cleanUp(completion: @escaping () -> Void = {}) {
         sessionGeneration += 1
         clearEntryObservations()
@@ -940,6 +981,12 @@ final class IosPictureInPictureController: NSObject,
         if autoStartArmed {
             activeFeed = false
             suspendOnStart = false
+            // 失败即释放 startRequested：否则一次 -1001 之后 Manual 路径
+            // 的重进也会被卡死的标志拦住。
+            if startRequested, !restoring {
+                startRequested = false
+                NSLog("SimpleLive PiP: startRequested released after failure (retry chain armed)")
+            }
             return
         }
         cleanUp()
