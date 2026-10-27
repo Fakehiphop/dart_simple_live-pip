@@ -249,11 +249,47 @@ final class IosPictureInPictureController: NSObject,
             forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.handleDidEnterBackground() }
         NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.handleWillResignActive() }
+        NotificationCenter.default.addObserver(
             forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.handleDidBecomeActive() }
         NotificationCenter.default.addObserver(
             forName: UIScene.didActivateNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.handleDidBecomeActive() }
+    }
+
+    /// 上滑离场的更早兜底：真机日志（044105/044139）显示两类失败——系统自动起窗慢
+    /// 于 0.5s，用户等不及缩回前台（fallback skipped state=0 ×4）；拖到后台 0.5s 再
+    /// 补 start 会被系统拒（start failed ×2，layerStatus=1 enqueued=114 仍被拒）。
+    /// willResignActive +0.25s 时 app 还在离场动画期（inactive），此刻主动 start 与
+    /// app 内手动按钮同款前台语义（manual + suspend 实测 100% 成功）。
+    /// 回前台（state==.active，手势取消）与已起窗（自动路径成功）都被条件排除。
+    private func handleWillResignActive() {
+        guard let pip = controller,
+              !pip.isPictureInPictureActive, pip.isPictureInPicturePossible,
+              pip.canStartPictureInPictureAutomaticallyFromInline || autoStartArmed,
+              hasEnqueuedFrame, !startRequested else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self = self else { return }
+            let state = UIApplication.shared.applicationState
+            let pipActive = self.controller?.isPictureInPictureActive ?? false
+            let possible = self.controller?.isPictureInPicturePossible ?? false
+            guard let pip = self.controller,
+                  state != .active, !pipActive, !self.startRequested,
+                  self.hasEnqueuedFrame, possible else {
+                NSLog("SimpleLive PiP: resign fallback skipped: state=%ld active=%@ startReq=%@ hasFrame=%@ possible=%@",
+                      state.rawValue,
+                      pipActive ? "true" : "false",
+                      self.startRequested ? "true" : "false",
+                      self.hasEnqueuedFrame ? "true" : "false",
+                      possible ? "true" : "false")
+                return
+            }
+            self.startRequested = true
+            NSLog("SimpleLive PiP: resign-active fallback startPictureInPicture issued (deact window)")
+            pip.startPictureInPicture()
+        }
     }
 
     private func handleDidEnterBackground() {
