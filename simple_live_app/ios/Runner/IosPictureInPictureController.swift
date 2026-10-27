@@ -1026,7 +1026,7 @@ final class IosPictureInPictureController: NSObject,
                         guard let self = self, self.sessionGeneration == gen,
                               self.enteredBackground,
                               UIApplication.shared.applicationState == .background,
-                              !self.isPictureInPictureActive,
+                              !(self.controller?.isPictureInPictureActive ?? false),
                               self.isPictureInPicturePossible,
                               self.hasEnqueuedFrame,
                               !self.startRequested else { return }
