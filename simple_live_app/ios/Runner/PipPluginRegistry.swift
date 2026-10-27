@@ -1,5 +1,6 @@
 import CoreVideo
 import Flutter
+import QuartzCore
 import UIKit
 
 // 通过 Flutter 公开纹理 API 观察帧（PiliPlus TextureTracker 的等价实现，
@@ -17,6 +18,10 @@ private final class PipTextureRegistry: NSObject, FlutterTextureRegistry {
     private let registry: FlutterTextureRegistry
     private let frameHandler: (CVPixelBuffer, Int64) -> Void
     private var textures: [Int64: FlutterTexture] = [:]
+    // 原始推送速率诊断：区分"mpv 推送稀疏"与"控制器侧节流"。
+    private var rawFrames: Int64 = 0
+    private var rawPulls: Int64 = 0
+    private var rawStatsAt: CFTimeInterval = 0
 
     init(registry: FlutterTextureRegistry, frameHandler: @escaping (CVPixelBuffer, Int64) -> Void) {
         self.registry = registry
@@ -43,10 +48,22 @@ private final class PipTextureRegistry: NSObject, FlutterTextureRegistry {
     func textureFrameAvailable(_ textureId: Int64) {
         // media-kit 在每次渲染完成后于平台线程调用此方法。
         // 不要指望 Flutter 在后台还会调用 copyPixelBuffer。
+        rawFrames += 1
         if let buffer = copyPixelBuffer(forTexture: textureId) {
+            rawPulls += 1
             frameHandler(buffer, textureId)
         }
         registry.textureFrameAvailable(textureId)
+        let now = CACurrentMediaTime()
+        if rawStatsAt == 0 { rawStatsAt = now }
+        if now - rawStatsAt >= 5 {
+            let seconds = now - rawStatsAt
+            NSLog("SimpleLive PiP: raw feed %.1f fps, pulls %.1f fps (frames=%lld pulls=%lld)",
+                  Double(rawFrames) / seconds, Double(rawPulls) / seconds, rawFrames, rawPulls)
+            rawFrames = 0
+            rawPulls = 0
+            rawStatsAt = now
+        }
     }
 }
 
