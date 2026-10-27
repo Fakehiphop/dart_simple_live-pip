@@ -123,7 +123,10 @@ class MpvOptionsService {
     if (!Platform.isAndroid) {
       return VideoControllerConfiguration(
         hwdec: _iosPipCopyBackHwdec(_desktopVideoControllerHwdec(effectiveOptions)),
-        enableHardwareAcceleration: settings.hardwareDecode.value,
+        // iOS 后台禁止 GPU 提交（kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted），
+        // TextureHW 在后台回调心跳照常但纹理内容冻结；渲染恒走 TextureSW（CPU 写 CVPixelBuffer）。
+        // 解码 hwdec 不动，仍走 VideoToolbox。
+        enableHardwareAcceleration: Platform.isIOS ? false : settings.hardwareDecode.value,
       );
     }
     return VideoControllerConfiguration(
