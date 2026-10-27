@@ -188,6 +188,7 @@ import MediaPlayer
       let pip = IosPictureInPictureController(messenger: engineBridge.applicationRegistrar.messenger())
       let registry = PipPluginRegistry(registry: engineBridge.pluginRegistry) {
         [weak pip] buffer, textureId in
+        pip?.noteFramePush()
         pip?.onVideoFrame(buffer, textureId: textureId)
       }
       pip.copyPixelBuffer = { [weak registry] textureId in
