@@ -9,11 +9,6 @@ import 'package:simple_live_app/app/controller/app_settings_controller.dart';
 import 'package:simple_live_app/app/log.dart';
 
 class MpvOptionsService {
-  /// iOS 画中画期间输出要切到软件渲染，硬解必须用 -copy 回读模式，
-  /// 否则解码帧留在 GPU，软件输出拿不到画面。
-  /// 由播放器初始化时按画中画可用性设置（见 PlayerMixin.initializePlayer），
-  /// 必须在创建 VideoController 之前生效。
-  static bool iosPipCopyBackDecoder = false;
 
   static const Map<String, String> profileLabels = {
     "performance": "流畅",
@@ -122,7 +117,7 @@ class MpvOptionsService {
     final options = effectiveOptions.options;
     if (!Platform.isAndroid) {
       return VideoControllerConfiguration(
-        hwdec: _iosPipCopyBackHwdec(_desktopVideoControllerHwdec(effectiveOptions)),
+        hwdec: _desktopVideoControllerHwdec(effectiveOptions),
         enableHardwareAcceleration: settings.hardwareDecode.value,
       );
     }
@@ -148,10 +143,7 @@ class MpvOptionsService {
   };
 
   static Future<void> applyToPlayer(Player player) async {
-    if (player.platform is! NativePlayer) {
-      return;
-    }
-    final nativePlayer = player.platform as dynamic;
+    // PiliPlus 路线：Player 即 NativePlayer（typedef），setProperty 同步调用。
     // iOS 的视频管线固定，只应用网络默认参数；audio-exclusive 使 mpv 不使用
     // MixWithOthers，与 AppDelegate 的 .playback 类别保持一致。
     if (Platform.isIOS) {
@@ -161,7 +153,7 @@ class MpvOptionsService {
       };
       for (final entry in iosOptions.entries) {
         try {
-          await nativePlayer.setProperty(entry.key, entry.value);
+          player.setProperty(entry.key, entry.value);
         } catch (e) {
           Log.d("mpv ios option skipped: ${entry.key}=${entry.value} $e");
         }
@@ -174,7 +166,7 @@ class MpvOptionsService {
       ..remove("hwdec");
     for (final entry in options.entries) {
       try {
-        await nativePlayer.setProperty(entry.key, entry.value);
+        player.setProperty(entry.key, entry.value);
       } catch (e) {
         Log.d("mpv option skipped: ${entry.key}=${entry.value} $e");
       }
@@ -211,24 +203,7 @@ class MpvOptionsService {
     return options.options["hwdec"];
   }
 
-  /// iOS 画中画可用时把硬解映射到 copy-back 变体（与 Kazumi 的映射一致）。
-  static String? _iosPipCopyBackHwdec(String? hwdec) {
-    if (!Platform.isIOS || !iosPipCopyBackDecoder) {
-      return hwdec;
-    }
-    switch (hwdec) {
-      case 'auto':
-        return 'auto-copy';
-      case 'auto-safe':
-        return 'auto-copy-safe';
-      case 'videotoolbox':
-        return 'videotoolbox-copy';
-      default:
-        return hwdec;
-    }
-  }
-
-  static String diagnosticsSummary() {
+    static String diagnosticsSummary() {
     final effectiveOptions = effectiveOptionsWithSource();
     final options = effectiveOptions.options;
     String value(String key) {

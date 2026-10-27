@@ -16,18 +16,39 @@ class MultiRoomPlayerController extends GetxController {
 
   MultiRoomPlayerController(this.item);
 
-  late final Player player = Player(
-    configuration: PlayerConfiguration(
-      title: item.userName,
-      logLevel: AppSettingsController.instance.logEnable.value
-          ? MPVLogLevel.info
-          : MPVLogLevel.error,
-    ),
-  );
-  late final VideoController videoController = VideoController(
-    player,
-    configuration: MpvOptionsService.videoControllerConfiguration(),
-  );
+  late Player player;
+  /// 视频控制器（PiliPlus 路线：1.2.5 API 无同步工厂，异步创建）。
+  final videoController = Rx<VideoController?>(null);
+
+  @override
+  void onInit() {
+    super.onInit();
+    unawaited(_init());
+  }
+
+  Future<void> _init() async {
+    player = await Player.create(
+      configuration: PlayerConfiguration(
+        title: item.userName,
+        logLevel: AppSettingsController.instance.logEnable.value
+            ? MPVLogLevel.info
+            : MPVLogLevel.error,
+      ),
+    );
+    await _ensureVideoController();
+    await MpvOptionsService.applyToPlayer(player);
+    await load();
+  }
+
+  Future<void> _ensureVideoController() async {
+    if (videoController.value != null) {
+      return;
+    }
+    videoController.value = await VideoController.create(
+      player,
+      configuration: MpvOptionsService.videoControllerConfiguration(),
+    );
+  }
 
   final detail = Rx<LiveRoomDetail?>(null);
   final loading = true.obs;
@@ -58,11 +79,7 @@ class MultiRoomPlayerController extends GetxController {
   }
 
   @override
-  void onInit() {
-    super.onInit();
-    unawaited(MpvOptionsService.applyToPlayer(player));
-    unawaited(load());
-  }
+
 
   Future<void> load() async {
     if (_disposed) {
@@ -173,7 +190,10 @@ class MultiRoomPlayerController extends GetxController {
     if (AppSettingsController.instance.playerForceHttps.value) {
       url = url.replaceAll("http://", "https://");
     }
-    await player.open(Media(url, httpHeaders: _playHeaders));
+    if (_playHeaders != null) {
+      player.setMediaHeader(headers: _playHeaders);
+    }
+    await player.open(Media(url));
     if (!_isLoadCurrent(generation)) {
       return;
     }

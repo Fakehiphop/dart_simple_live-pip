@@ -705,27 +705,38 @@ class LiveRoomPage extends GetView<LiveRoomController> {
         const Positioned.fill(
           child: ColoredBox(color: Colors.black),
         ),
-        Video(
-          key: controller.globalPlayerKey,
-          controller: controller.videoController,
-          // iOS 画中画激活时退后台不能暂停，否则系统小窗画面冻结。
-          // iOS 的退后台暂停/恢复职责已移交 LiveRoomController 的生命周期
-          // 处理（需在退后台瞬间自动进入画中画），因此 iOS 交给 media_kit
-          // 的自动暂停必须关闭，避免竞态下把小窗里的播放器暂停。
-          pauseUponEnteringBackgroundMode:
-              !(Platform.isIOS ||
-                  AppSettingsController.instance.allowBackgroundPlayback.value ||
-                  controller.iosInPipState.value),
-          resumeUponEnteringForegroundMode:
-              !Platform.isIOS &&
-                  !AppSettingsController.instance.allowBackgroundPlayback.value,
-          controls:
-              pipMode ? null : (state) => playerControls(state, controller),
-          aspectRatio: aspectRatio,
-          fit: boxFit,
-          // 自己实现
-          wakelock: false,
-        ),
+        Obx(() {
+          final vc = controller.videoController.value;
+          if (vc == null) {
+            // PiliPlus 路线：VideoController 异步创建，完成前显示占位。
+            return const Positioned.fill(
+              child: ColoredBox(color: Colors.black),
+            );
+          }
+          return Video(
+            key: controller.globalPlayerKey,
+            controller: vc,
+            // iOS 画中画激活时退后台不能暂停，否则系统小窗画面冻结。
+            // iOS 的退后台暂停/恢复职责已移交 LiveRoomController 的生命周期
+            // 处理（退后台自动进入由原生系统自动启动标志承担），因此 iOS
+            // 交给 media_kit 的自动暂停必须关闭。
+            pauseUponEnteringBackgroundMode:
+                !(Platform.isIOS ||
+                    AppSettingsController.instance.allowBackgroundPlayback
+                        .value ||
+                    controller.iosInPipState.value),
+            resumeUponEnteringForegroundMode:
+                !Platform.isIOS &&
+                    !AppSettingsController
+                        .instance.allowBackgroundPlayback.value,
+            controls:
+                pipMode ? null : (state) => playerControls(state, controller),
+            aspectRatio: aspectRatio,
+            fit: boxFit,
+            // 自己实现
+            wakelock: false,
+          );
+        }),
         if (!pipMode)
           Obx(
             () => Visibility(

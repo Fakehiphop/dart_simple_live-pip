@@ -99,11 +99,18 @@ class _MultiRoomTile extends StatelessWidget {
         child: Stack(
           children: [
             Positioned.fill(
-              child: Video(
-                controller: controller.videoController,
-                controls: NoVideoControls,
-                fit: BoxFit.contain,
-              ),
+              child: Obx(() {
+                final vc = controller.videoController.value;
+                if (vc == null) {
+                  // VideoController 异步创建，完成前显示占位。
+                  return const ColoredBox(color: Colors.black);
+                }
+                return Video(
+                  controller: vc,
+                  controls: NoVideoControls,
+                  fit: BoxFit.contain,
+                );
+              }),
             ),
             Positioned.fill(
               child: Obx(

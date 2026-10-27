@@ -2,14 +2,13 @@ import UIKit
 import Flutter
 import UserNotifications
 import AVFoundation
+import MediaPlayer
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private var audioChannel: FlutterMethodChannel?
   private var backgroundTasks: [Int: UIBackgroundTaskIdentifier] = [:]
   private var nextBackgroundTaskId = 1
-  private var pipController: NSObject?
-  private var pipPluginRegistry: PipPluginRegistry?
 
   override func application(
     _ application: UIApplication,
@@ -17,6 +16,7 @@ import AVFoundation
   ) -> Bool {
     UNUserNotificationCenter.current().delegate = self
     configureAudioSession()
+    configureNowPlaying()
     registerAudioObservers()
 
     if let controller = window?.rootViewController as? FlutterViewController {
@@ -70,6 +70,41 @@ import AVFoundation
       try session.setActive(true)
     } catch {
       NSLog("Simple Live: failed to configure audio session: \(error)")
+    }
+  }
+
+  // MARK: - Now Playing
+
+  /// Registers the app as a Now Playing candidate at launch.
+  ///
+  /// mediaserverd grants background GPU submission only to the app it deems
+  /// "Now Playing eligible" (an audio session alone is not enough; the audio
+  /// client is then rejected with kIOGPUCommandBufferCallbackErrorBackground
+  /// ExecutionNotPermitted and the PiP window freezes on the last frame).
+  /// Eligibility requires `MPNowPlayingInfoCenter` registration plus at least
+  /// one enabled `MPRemoteCommandCenter` handler, evaluated when the audio I/O
+  /// starts - i.e. before any PiP session exists - hence the early setup.
+  private func configureNowPlaying() {
+    MPNowPlayingInfoCenter.default().nowPlayingInfo = [
+      MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.video.rawValue,
+      MPNowPlayingInfoPropertyIsLiveStream: true,
+      MPNowPlayingInfoPropertyPlaybackRate: 0.0,
+    ]
+    let commands = MPRemoteCommandCenter.shared()
+    commands.playCommand.isEnabled = true
+    commands.playCommand.addTarget { _ in
+      PipPlugin.remoteSetPlaying(true)
+      return .success
+    }
+    commands.pauseCommand.isEnabled = true
+    commands.pauseCommand.addTarget { _ in
+      PipPlugin.remoteSetPlaying(false)
+      return .success
+    }
+    commands.togglePlayPauseCommand.isEnabled = true
+    commands.togglePlayPauseCommand.addTarget { _ in
+      PipPlugin.remoteTogglePlaying()
+      return .success
     }
   }
 
@@ -158,26 +193,17 @@ import AVFoundation
   // MARK: - Notifications
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
+    GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     if #available(iOS 15.0, *) {
-      // iOS 画中画：包装插件注册表截获 media-kit 的纹理帧，交给原生
-      // PiP 控制器喂给 AVSampleBufferDisplayLayer。渲染后端全程恒定，
-      // 不再接线软件渲染切换（PiliPlus 同构）。
-      let pip = IosPictureInPictureController(messenger: engineBridge.applicationRegistrar.messenger())
-      let registry = PipPluginRegistry(registry: engineBridge.pluginRegistry) {
-        [weak pip] buffer, textureId in
-        pip?.onVideoFrame(buffer, textureId: textureId)
+      // iOS 画中画（PiliPlus 路线）：被动帧泵 + AVSampleBufferDisplayLayer，
+      // 不切换渲染管线。原生实现见 PipPlugin.swift。
+      if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "PipPlugin") {
+        PipPlugin.register(with: registrar)
       }
-      pip.copyPixelBuffer = { [weak registry] textureId in
-        registry?.copyPixelBuffer(forTexture: textureId)
-      }
-      pipController = pip
-      pipPluginRegistry = registry
-      GeneratedPluginRegistrant.register(with: registry)
     } else {
-      GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
       // iOS < 15 无画中画能力，Dart 侧按 unsupported 处理。
       let pipChannel = FlutterMethodChannel(
-        name: "simple_live/ios_pip",
+        name: "simple_live/pip",
         binaryMessenger: engineBridge.applicationRegistrar.messenger()
       )
       pipChannel.setMethodCallHandler { _, result in result(false) }
