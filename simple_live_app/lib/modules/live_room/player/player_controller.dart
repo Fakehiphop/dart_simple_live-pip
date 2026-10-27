@@ -168,6 +168,10 @@ mixin PlayerMixin {
   GlobalKey<VideoState> globalPlayerKey = GlobalKey<VideoState>();
   GlobalKey globalDanmuKey = GlobalKey();
 
+  /// iOS PiP 锁屏卡片标题（主播名/房间标题）。默认空，由具体页面覆盖。
+  String get pipNowPlayingTitle => '';
+  String get pipNowPlayingArtist => '';
+
   /// 播放器实例
   late final player = Player(
     configuration: PlayerConfiguration(
@@ -1656,6 +1660,13 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     if (pip == null) {
       return;
     }
+    // 锁屏卡片标题（主播名 + 直播间标题），随武装一起推送。
+    unawaited(
+      pip.updateNowPlayingInfo(
+        title: pipNowPlayingTitle,
+        artist: pipNowPlayingArtist,
+      ),
+    );
     _iosPipAutoStartArmed = await pip.ensurePrepared();
     Log.d(
         'iOS PiP: 早武装${_iosPipAutoStartArmed ? '完成（系统自动启动已开启）' : '失败'}');
