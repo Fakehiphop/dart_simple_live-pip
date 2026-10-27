@@ -85,11 +85,11 @@ final class IosPictureInPictureController: NSObject,
     /// Replace：高频 Replace 是资格翻 NOT 的诱因之一，11306 实测）。
     private var lastNowPlayingPlaying = false
     private var lastNowPlayingSynced = false
-    // 锁屏封面素材：喂帧每 3s 更新引用；MPMediaItemArtwork 仅在会话首次
-    // 起窗时设置一次（周期性更新曾把资格翻 NOT，11306 实测）。
-    private var lastArtworkBuffer: CVPixelBuffer?
-    private var lastArtworkAt: Double = 0
-    private var artworkSetForSession = false
+    // 锁屏封面（11310 同款）：每会话一次性生成 320×320 JPEG（CI 走
+    // software renderer，后台 Metal 会被 BackgroundExecutionNotPermitted 拒），
+    // 不再周期性整包 Replace。
+    private var lastArtworkBuffer: Data?
+    private var lastArtworkRequested = false
     // 喂帧兜底泵：小窗期间即使 mpv 推送变稀也按 30Hz 主动拉帧。
     private var feedPump: DispatchSourceTimer?
     private let feedPumpQueue = DispatchQueue(label: "SimpleLive.PiP.feedPump")
@@ -231,11 +231,11 @@ final class IosPictureInPictureController: NSObject,
         }
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] =
             NSNumber(value: timebase.map { CMTimeGetSeconds(CMTimebaseGetTime($0)) } ?? 0)
-        // artwork 仅随本函数低频调用写入（willStart / 播放状态翻转），
-        // 不再周期性整包 Replace（11306 教训：高频 Replace + 封面会把
-        // mediaserverd 的 audio client 资格翻 NOT → PiP 期 GPU 被拒）。
-        if let buf = lastArtworkBuffer {
-            info[MPMediaItemPropertyArtwork] = makeArtwork(buf)
+        // 封面回归（11310）：11306 实测资格 NOT 的诱因是"每 3s 大图整包
+        // Replace + 768×768"。频率已收敛（只在状态翻转时触发刷新），每会话
+        // 只生成一次 320×320 小图，资格不再翻 NOT（待真机回归）。
+        if let data = lastArtworkBuffer, let img = UIImage(data: data) {
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
@@ -259,6 +259,9 @@ final class IosPictureInPictureController: NSObject,
     /// 以 enteredBackground 为前提，避免自动启动瞬间被自己停掉。
     private func registerLifecycleObservers() {
         NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.handleWillResignActive() }
+        NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.handleDidEnterBackground() }
         NotificationCenter.default.addObserver(
@@ -267,6 +270,39 @@ final class IosPictureInPictureController: NSObject,
         NotificationCenter.default.addObserver(
             forName: UIScene.didActivateNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.handleDidBecomeActive() }
+    }
+
+    /// 离场窗口兜底（c1 11309）：系统自动起窗在 willResignActive 期查询；
+    /// 查询未发生时，0.5s 后的 .background 显式 start 会被 -1001 拒（真机
+    /// start failed ×2），而离场窗口期（inactive）启动与手动路径同环境
+    /// （manual + suspend 实测 100% 成功）。willResignActive +0.25s 时 app
+    /// 尚未完全后台，此刻 start 在 -1001 墙之前。回前台（state==.active）
+    /// 时取消，排除自动路径已成功与误触。
+    private func handleWillResignActive() {
+        guard let pip = controller,
+              !pip.isPictureInPictureActive, pip.isPictureInPicturePossible,
+              pip.canStartPictureInPictureAutomaticallyFromInline || autoStartArmed,
+              hasEnqueuedFrame, !startRequested else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self = self else { return }
+            let state = UIApplication.shared.applicationState
+            let pipActive = self.controller?.isPictureInPictureActive ?? false
+            let possible = self.controller?.isPictureInPicturePossible ?? false
+            guard let pip = self.controller,
+                  state != .active, !pipActive, !self.startRequested,
+                  self.hasEnqueuedFrame, possible else {
+                NSLog("SimpleLive PiP: resign fallback skipped: state=%ld active=%@ startReq=%@ hasFrame=%@ possible=%@",
+                      state.rawValue,
+                      pipActive ? "true" : "false",
+                      self.startRequested ? "true" : "false",
+                      self.hasEnqueuedFrame ? "true" : "false",
+                      possible ? "true" : "false")
+                return
+            }
+            self.startRequested = true
+            NSLog("SimpleLive PiP: resign-active fallback startPictureInPicture issued (deact window)")
+            pip.startPictureInPicture()
+        }
     }
 
     private func handleDidEnterBackground() {
@@ -360,39 +396,6 @@ final class IosPictureInPictureController: NSObject,
         syncFeedPump()
     }
 
-    /// 本次会话首次把封面写入 Now Playing（willStart 调用一次）。
-    private func setSessionArtworkOnce() {
-        guard !artworkSetForSession, let buf = lastArtworkBuffer else { return }
-        artworkSetForSession = true
-        let w = CVPixelBufferGetWidth(buf)
-        let h = CVPixelBufferGetHeight(buf)
-        NSLog("SimpleLive PiP: now playing artwork set %dx%d", w, h)
-        refreshNowPlayingInfo()
-    }
-
-    /// 从缓冲帧构造 MPMediaItemArtwork（惰性位图，系统按需取图）。
-    private func makeArtwork(_ buffer: CVPixelBuffer) -> MPMediaItemArtwork {
-        let w = CVPixelBufferGetWidth(buffer)
-        let h = CVPixelBufferGetHeight(buffer)
-        return MPMediaItemArtwork(boundsSize: CGSize(width: w, height: h)) { _ in
-            CVPixelBufferLockBaseAddress(buffer, .readOnly)
-            defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-            guard let base = CVPixelBufferGetBaseAddress(buffer) else { return UIImage() }
-            let ctx = CGContext(
-                data: base,
-                width: w,
-                height: h,
-                bitsPerComponent: 8,
-                bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                    | CGBitmapInfo.byteOrder32Little.rawValue
-            )
-            guard let cg = ctx?.makeImage() else { return UIImage() }
-            return UIImage(cgImage: cg)
-        }
-    }
-
     /// 喂帧泵在场条件统一入口：PiP 活跃，或已武装且有帧。武装窗口内保持
     /// 30Hz 拉取，让退后台判定时刻图层始终有鲜活内容——自动启动成败与
     /// 该时刻图层新鲜度强相关（真机实测：enq=24 成功 vs enq=11/4 失败）。
@@ -447,8 +450,8 @@ final class IosPictureInPictureController: NSObject,
             pip.delegate = self
             pip.canStartPictureInPictureAutomaticallyFromInline = false
             controller = pip
-            artworkSetForSession = false
-            lastArtworkAt = 0
+            lastArtworkBuffer = nil
+            lastArtworkRequested = false
             lastNowPlayingPlaying = playing
             lastNowPlayingSynced = false
             NSLog("SimpleLive PiP: session created")
@@ -688,8 +691,7 @@ final class IosPictureInPictureController: NSObject,
         mainHopCount = 0
         lastStatsAt = 0
         lastArtworkBuffer = nil
-        lastArtworkAt = 0
-        artworkSetForSession = false
+        lastArtworkRequested = false
         lastNowPlayingPlaying = false
         lastNowPlayingSynced = false
         // 渲染后端全程恒定，无渲染器需要恢复。
@@ -748,6 +750,26 @@ final class IosPictureInPictureController: NSObject,
         if willStartAt > 0 {
             NSLog("SimpleLive PiP: first frame after willStart in %.0fms", (now - willStartAt) * 1000)
             willStartAt = 0
+        }
+        // 封面/锁屏卡片的方框：每会话只生成一次。CI 走 software renderer
+        // （后台 CIContext 默认 Metal 会被 BackgroundExecutionNotPermitted
+        // 拒掉），成功后整场刷新一次卡片图。
+        if !lastArtworkRequested {
+            lastArtworkRequested = true
+            let src = source
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { return }
+                let ci = CIImage(cvPixelBuffer: src)
+                let w = CGFloat(CVPixelBufferGetWidth(src))
+                let h = CGFloat(CVPixelBufferGetHeight(src))
+                let scale = 320.0 / max(w, h)
+                let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                let ctx = CIContext(options: [.useSoftwareRenderer: true])
+                guard let cg = ctx.createCGImage(scaled, from: scaled.extent),
+                      let jpeg = UIImage(cgImage: cg).jpegData(compressionQuality: 0.8) else { return }
+                self.lastArtworkBuffer = jpeg
+                DispatchQueue.main.async { self.refreshNowPlayingInfo() }
+            }
         }
 
         // 输出尺寸：长边上限 960，其余交给 AVSampleBufferDisplayLayer 按
@@ -866,11 +888,6 @@ final class IosPictureInPictureController: NSObject,
         if entryResult != nil {
             DispatchQueue.main.async { [weak self] in self?.startIfPossible() }
         }
-        // 每 3 秒留一帧作锁屏封面素材（强引用一帧，池阈值 10 足够轮转）。
-        if now - lastArtworkAt > 3.0 {
-            lastArtworkAt = now
-            lastArtworkBuffer = buffer
-        }
     }
 
     private func markDisplayImmediately(_ sample: CMSampleBuffer) {
@@ -970,7 +987,6 @@ final class IosPictureInPictureController: NSObject,
             }
         }
         refreshNowPlayingInfo()
-        setSessionArtworkOnce()
         NSLog("SimpleLive PiP: will start (%@)",
               suspendOnStart ? "manual + suspend" : "auto")
         channel.invokeMethod("onModeChanged", arguments: ["isInPipMode": true])
