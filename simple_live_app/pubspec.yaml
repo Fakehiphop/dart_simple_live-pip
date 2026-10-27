@@ -110,6 +110,18 @@ dependency_overrides:
   sherpa_onnx_ios: 1.13.4
   # PiliPlus 的 media-kit fork 四件套：media_kit / media_kit_video 之外，
   # 事件循环与各平台动态库也必须同源（后台持续推帧能力的关键）。
+  # 关键：media_kit_video fork 声明的是 hosted media_kit 依赖，必须用
+  # override 统一到 git 源，否则 pub 报 "media_kit_video from git is forbidden"。
+  media_kit:
+    git:
+      url: https://github.com/My-Responsitories/media-kit.git
+      ref: native
+      path: media_kit
+  media_kit_video:
+    git:
+      url: https://github.com/bggRGjQaUbCoE/media-kit.git
+      ref: native
+      path: media_kit_video
   media_kit_native_event_loop:
     git:
       url: https://github.com/My-Responsitories/media-kit.git
