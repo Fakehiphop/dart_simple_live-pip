@@ -76,9 +76,6 @@ final class IosPictureInPictureController: NSObject,
     private var mainHopDelaySum = 0.0
     private var mainHopCount = 0
     private var lastStatsAt = 0.0
-    // 锁屏/控制中心卡片的 Now Playing 封面：定期取一帧缩放后的缓冲。
-    private var lastArtworkBuffer: CVPixelBuffer?
-    private var lastArtworkAt = 0.0
     // 锁屏卡片标题：主播名 + 直播间标题，Dart 推送。
     private var nowPlayingTitle = "SimpleLive"
     private var nowPlayingArtist = ""
@@ -220,27 +217,9 @@ final class IosPictureInPictureController: NSObject,
         }
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] =
             NSNumber(value: timebase.map { CMTimeGetSeconds(CMTimebaseGetTime($0)) } ?? 0)
-        if let artworkBuffer = lastArtworkBuffer {
-            let width = CVPixelBufferGetWidth(artworkBuffer)
-            let height = CVPixelBufferGetHeight(artworkBuffer)
-            // 惰性求值：系统真正要图时才在后台队列解码，闭包强持有缓冲保证存活。
-            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(
-                boundsSize: CGSize(width: width, height: height),
-                requestHandler: { _ in
-                    CVPixelBufferLockBaseAddress(artworkBuffer, .readOnly)
-                    defer { CVPixelBufferUnlockBaseAddress(artworkBuffer, .readOnly) }
-                    guard let context = CGContext(
-                        data: CVPixelBufferGetBaseAddress(artworkBuffer),
-                        width: width, height: height, bitsPerComponent: 8,
-                        bytesPerRow: CVPixelBufferGetBytesPerRow(artworkBuffer),
-                        space: CGColorSpaceCreateDeviceRGB(),
-                        bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue
-                            | CGImageAlphaInfo.premultipliedFirst.rawValue
-                    ), let image = context.makeImage() else { return UIImage() }
-                    return UIImage(cgImage: image)
-                }
-            )
-        }
+        // 不推送 artwork（11306 实测：768×768 封面 + 每秒级整包 Replace 后
+        // mediaserverd 的 audio client 资格翻为 NOT，PiP 期 GPU 被拒 = 卡顿；
+        // 11305 无 artwork 同报 PID Mismatch 却全程 YES）。先保资格与标题。
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
@@ -608,8 +587,6 @@ final class IosPictureInPictureController: NSObject,
         mainHopDelaySum = 0
         mainHopCount = 0
         lastStatsAt = 0
-        lastArtworkBuffer = nil
-        lastArtworkAt = 0
         // 渲染后端全程恒定，无渲染器需要恢复。
         completion()
     }
@@ -733,11 +710,6 @@ final class IosPictureInPictureController: NSObject,
         }
         CVPixelBufferUnlockBaseAddress(buffer, [])
         CVPixelBufferUnlockBaseAddress(source, .readOnly)
-        if now - lastArtworkAt > 3.0 {
-            // 每 3 秒换一帧作锁屏卡片封面（帧已缩放、第四字节已置 255）。
-            lastArtworkAt = now
-            lastArtworkBuffer = buffer
-        }
         if formatDescription == nil {
             CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
                                                         imageBuffer: buffer, formatDescriptionOut: &formatDescription)
