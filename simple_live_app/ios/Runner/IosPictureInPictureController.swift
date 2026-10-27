@@ -72,6 +72,9 @@ final class IosPictureInPictureController: NSObject,
     private var sourceFrames = 0
     private var droppedFrames = 0
     private var lastStatsAt = 0.0
+    // 锁屏/控制中心卡片的 Now Playing 封面：定期取一帧缩放后的缓冲。
+    private var lastArtworkBuffer: CVPixelBuffer?
+    private var lastArtworkAt = 0.0
 
     init(messenger: FlutterBinaryMessenger) {
         channel = FlutterMethodChannel(name: "simple_live/ios_pip", binaryMessenger: messenger)
@@ -158,6 +161,27 @@ final class IosPictureInPictureController: NSObject,
         info[MPNowPlayingInfoPropertyPlaybackRate] = NSNumber(value: playing ? lastRate : 0.0)
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] =
             NSNumber(value: timebase.map { CMTimeGetSeconds(CMTimebaseGetTime($0)) } ?? 0)
+        if let artworkBuffer = lastArtworkBuffer {
+            let width = CVPixelBufferGetWidth(artworkBuffer)
+            let height = CVPixelBufferGetHeight(artworkBuffer)
+            // 惰性求值：系统真正要图时才在后台队列解码，闭包强持有缓冲保证存活。
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(
+                boundsSize: CGSize(width: width, height: height),
+                requestHandler: { _ in
+                    CVPixelBufferLockBaseAddress(artworkBuffer, .readOnly)
+                    defer { CVPixelBufferUnlockBaseAddress(artworkBuffer, .readOnly) }
+                    guard let context = CGContext(
+                        data: CVPixelBufferGetBaseAddress(artworkBuffer),
+                        width: width, height: height, bitsPerComponent: 8,
+                        bytesPerRow: CVPixelBufferGetBytesPerRow(artworkBuffer),
+                        space: CGColorSpaceCreateDeviceRGB(),
+                        bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue
+                            | CGImageAlphaInfo.premultipliedFirst.rawValue
+                    ), let image = context.makeImage() else { return UIImage() }
+                    return UIImage(cgImage: image)
+                }
+            )
+        }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
@@ -508,6 +532,8 @@ final class IosPictureInPictureController: NSObject,
         sourceFrames = 0
         droppedFrames = 0
         lastStatsAt = 0
+        lastArtworkBuffer = nil
+        lastArtworkAt = 0
         // 渲染后端全程恒定，无渲染器需要恢复。
         completion()
     }
@@ -617,6 +643,11 @@ final class IosPictureInPictureController: NSObject,
         }
         CVPixelBufferUnlockBaseAddress(buffer, [])
         CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        if now - lastArtworkAt > 3.0 {
+            // 每 3 秒换一帧作锁屏卡片封面（帧已缩放、第四字节已置 255）。
+            lastArtworkAt = now
+            lastArtworkBuffer = buffer
+        }
         if formatDescription == nil {
             CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
                                                         imageBuffer: buffer, formatDescriptionOut: &formatDescription)
