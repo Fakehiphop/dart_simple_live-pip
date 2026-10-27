@@ -261,13 +261,14 @@ final class IosPictureInPictureController: NSObject,
         let bounds = window.bounds
         guard bounds.width > 0, bounds.height > 0 else { return }
         var target: CGRect
-        let aspectSource = renderSize.width > 0 && renderSize.height > 0
-            ? renderSize
-            : (lastSourceRect ?? .zero)
-        if aspectSource.width > 0, aspectSource.height > 0 {
-            let scale = min(bounds.width / aspectSource.width, bounds.height / aspectSource.height)
-            let width = aspectSource.width * scale
-            let height = aspectSource.height * scale
+        let aspectSize: CGSize = {
+            if renderSize.width > 0, renderSize.height > 0 { return renderSize }
+            return lastSourceRect?.size ?? .zero
+        }()
+        if aspectSize.width > 0, aspectSize.height > 0 {
+            let scale = min(bounds.width / aspectSize.width, bounds.height / aspectSize.height)
+            let width = aspectSize.width * scale
+            let height = aspectSize.height * scale
             let top = window.safeAreaInsets.top
             target = CGRect(x: (bounds.width - width) / 2,
                             y: (bounds.height - height) / 2 + top / 2,
@@ -602,16 +603,18 @@ final class IosPictureInPictureController: NSObject,
     }
 
     private func enqueue(_ sample: CMSampleBuffer, on layer: AVSampleBufferDisplayLayer) {
-        let renderer: AVSampleBufferVideoRenderer
         if #available(iOS 17.0, *) {
-            renderer = layer.sampleBufferRenderer
-        } else {
-            renderer = layer
+            let renderer = layer.sampleBufferRenderer
+            if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
+                renderer.flush()
+            }
+            renderer.enqueue(sample)
+            return
         }
-        if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
-            renderer.flush()
+        if layer.status == .failed || layer.requiresFlushToResumeDecoding {
+            layer.flush()
         }
-        renderer.enqueue(sample)
+        layer.enqueue(sample)
     }
 
     private func logFrameStats(now: Double) {
