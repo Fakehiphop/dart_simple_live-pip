@@ -2,6 +2,7 @@ import AVKit
 import Accelerate
 import Flutter
 import UIKit
+import MediaPlayer
 
 // PiliPlus 同构实现（本轮重写）：
 //   1. 只用一个自动启动机制：`canStartPictureInPictureAutomaticallyFromInline`
@@ -47,6 +48,7 @@ final class IosPictureInPictureController: NSObject,
     private var textureId: Int64?
     private var lastSourceRect: CGRect?
     private var playing = false
+    private var lastRate = 1.0
     private var duration: Double = 0
     private var timebase: CMTimebase?
     private var pixelBufferPool: CVPixelBufferPool?
@@ -75,6 +77,7 @@ final class IosPictureInPictureController: NSObject,
         channel = FlutterMethodChannel(name: "simple_live/ios_pip", binaryMessenger: messenger)
         super.init()
         registerLifecycleObservers()
+        registerNowPlaying()
         channel.setMethodCallHandler { [weak self] call, result in
             guard let self = self else { result(false); return }
             let args = call.arguments as? [String: Any] ?? [:]
@@ -106,6 +109,56 @@ final class IosPictureInPictureController: NSObject,
                 result(FlutterMethodNotImplemented)
             }
         }
+    }
+
+    /// Now Playing 资格注册：mediaserverd 只把后台 GPU 提交权授予它认定为
+    /// "Now Playing eligible" 的应用——仅有音频会话（.playback + setActive）
+    /// 不够，还要求 MPNowPlayingInfoCenter 已注册且 MPRemoteCommandCenter
+    /// 至少有一条启用的命令处理器，资格在音频 I/O 启动时评估。控制器随
+    /// Flutter 引擎引导创建（早于任何直播流的 I/O），在此处注册即可。
+    /// 缺资格的实测表现：PiP 层在后台持续收到
+    /// kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted，
+    /// 小窗停在最后两帧之间来回抖动（表现为 2 帧动图）。
+    private func registerNowPlaying() {
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = [
+            MPMediaItemPropertyTitle: "SimpleLive",
+            MPNowPlayingInfoPropertyIsLiveStream: NSNumber(value: true),
+            MPNowPlayingInfoPropertyPlaybackRate: NSNumber(value: 0.0),
+        ]
+        let commands = MPRemoteCommandCenter.shared()
+        commands.playCommand.isEnabled = true
+        commands.playCommand.addTarget { [weak self] _ in
+            self?.forwardRemoteAction(play: true)
+            return .success
+        }
+        commands.pauseCommand.isEnabled = true
+        commands.pauseCommand.addTarget { [weak self] _ in
+            self?.forwardRemoteAction(play: false)
+            return .success
+        }
+        commands.togglePlayPauseCommand.isEnabled = true
+        commands.togglePlayPauseCommand.addTarget { [weak self] _ in
+            guard let self = self else { return .commandFailed }
+            self.forwardRemoteAction(play: !self.playing)
+            return .success
+        }
+        NSLog("SimpleLive PiP: now playing registered at launch")
+    }
+
+    /// 锁屏/控制中心的播放命令 → 复用 Dart 侧既有的 onAction 通路
+    /// （与小窗叠加层按钮同一条协议）。
+    private func forwardRemoteAction(play: Bool) {
+        channel.invokeMethod("onAction", arguments: ["action": play ? "play" : "pause"])
+    }
+
+    /// Now Playing 速率/进度跟随：控制中心卡片据此显示"在播"状态；
+    /// mediaserverd 的资格评估同样参考（rate=0 视为未播放）。
+    private func refreshNowPlayingInfo() {
+        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [String: Any]()
+        info[MPNowPlayingInfoPropertyPlaybackRate] = NSNumber(value: playing ? lastRate : 0.0)
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] =
+            NSNumber(value: timebase.map { CMTimeGetSeconds(CMTimebaseGetTime($0)) } ?? 0)
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
     /// 建立画中画会话（内容源 + delegate + 时基）。开播即调用（早武装），
@@ -292,6 +345,7 @@ final class IosPictureInPictureController: NSObject,
         duration = max(0, (args["durationMillis"] as? NSNumber)?.doubleValue ?? 0) / 1000
         let position = max(0, (args["positionMillis"] as? NSNumber)?.doubleValue ?? 0) / 1000
         let rate = (args["rate"] as? NSNumber)?.doubleValue ?? 1
+        lastRate = rate
         if let timebase = timebase {
             CMTimebaseSetRateAndAnchorTime(
                 timebase,
@@ -316,6 +370,7 @@ final class IosPictureInPictureController: NSObject,
            let buffer = copyPixelBuffer?(id) {
             onVideoFrame(buffer, textureId: id)
         }
+        refreshNowPlayingInfo()
     }
 
     private func enter(_ result: @escaping FlutterResult) {
@@ -642,6 +697,7 @@ final class IosPictureInPictureController: NSObject,
         // 自动启动路径的过渡保护：立即通知 Dart 进入 PiP 模式
         // （同步定时器提前运行，绘制状态不再漂移）。
         activeFeed = true
+        refreshNowPlayingInfo()
         NSLog("SimpleLive PiP: will start (%@)",
               suspendOnStart ? "manual + suspend" : "auto")
         channel.invokeMethod("onModeChanged", arguments: ["isInPipMode": true])
