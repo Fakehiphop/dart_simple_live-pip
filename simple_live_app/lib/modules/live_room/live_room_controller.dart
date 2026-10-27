@@ -3956,24 +3956,14 @@ ${errorStackTrace ?? ""}''');
       Log.d("应用短暂失焦:$state");
       unawaited(syncAutoPipOnLeave());
       // iOS：趁仍在前台确认退后台画中画就绪（温热管线 + 系统自动启动开关）。
-      // 早武装已随开播完成，这里幂等确认一次并同步最新播放状态，
-      // v3 无渲染器切换。失焦也可能来自控制中心等误触发，
-      // 回前台时解除武装即可。
+      // 早武装已随开播完成，这里幂等确认一次并同步最新播放状态。
+      // 起窗交给系统（canStartPictureInPictureAutomaticallyFromInline），
+      // 这里不显式 start；控制中心/来电等短暂失焦不会起窗。
       if (Platform.isIOS &&
           AppSettingsController.instance.autoPipOnExit.value &&
           liveStatus.value &&
           !listenMode.value &&
           player.state.playing) {
-        // v11：三步串行，修掉 v10 引入的竞态。v10 把 enterAuto 改为
-        // inactive 瞬间发出（unawaited 与 prepareIosPipForResign 并发），
-        // 但 enterIosPipForBackground 的闸门 iosPipActiveOrEntering 含
-        // _armFlight.isRunning——prepareIosPipForResign 的 ensurePrepared
-        // 先入单飞闸门，enterAuto 同一 tick 到达即被静默吞掉（v10 真机
-        // 日志 05:58:45：第二次 attach 跑了，startPictureInPicture issued
-        // 全程 0 条）。现在串行：先同步最新状态（幂等），完成后必然
-        // 已过单飞窗口，再发 enterAuto——总耗时一次 attach 往返，仍在
-        // systemGesture 失活窗口内（数十毫秒级）。防误弹仍由原生
-        // applicationState != .active 闸门承担。
         unawaited(() async {
           await prepareIosPipForResign();
           await enterIosPipForBackground();
@@ -3992,9 +3982,11 @@ ${errorStackTrace ?? ""}''');
   /// （该职责已从 Video 的 pauseUponEnteringBackgroundMode 移交至此）。
   bool _iosPausedInBackgroundFallback = false;
 
-  /// iOS 退后台：优先依赖"已武装的系统自动启动"拉起画中画；
-  /// 未武装成功时才走完整进入流程兜底；均未进入且未开启"允许后台播放"
-  /// 时暂停，保持与原 media_kit 行为一致。
+  /// iOS 退后台：起窗只有一条合法路径——系统依
+  /// canStartPictureInPictureAutomaticallyFromInline 在退后台瞬间自行拉起。
+  /// 后台显式 startPictureInPicture 一律被系统拒绝（AVKitErrorDomain
+  /// -1001，场景态 Background），因此这里不做任何显式进入，只补一次
+  /// 武装并观察日志；均未进入且未开启"允许后台播放"时暂停。
   Future<void> _handleIosBackgroundPip() async {
     final wantAutoPip =
         AppSettingsController.instance.autoPipOnExit.value &&
@@ -4002,17 +3994,14 @@ ${errorStackTrace ?? ""}''');
             !listenMode.value &&
             player.state.playing;
     if (wantAutoPip) {
-      // 已武装（或进入中）：系统应在退后台瞬间自行拉起画中画，
-      // 这里只兜底——若延迟后仍未拉起则记录观察日志（不再显式进入）。
+      // 已武装（或进入中）：系统应在退后台瞬间自行拉起画中画。
       if (iosPipActiveOrEntering || iosPipAutoStartArmed) {
         _iosPausedInBackgroundFallback = false;
         _scheduleIosAutoPipFallbackStart();
         return;
       }
-      // 未武装：真机日志实证后台显式 startPictureInPicture 一律被系统
-      // 拒绝（AVKitErrorDomain -1001，场景态 Background 不允许硬闯），
-      // 完整进入流程在此必失败。v5 只补武装（前台来不及的竞态），
-      // 下一次退后台由系统标志直接拉起；本次拉不起则按原行为暂停。
+      // 前台竞态没来得及武装：这里补一次。会话若能在后台建立，
+      // 标志为真后系统仍可能在本次退后台末尾拉起；否则留待下一次。
       _iosPausedInBackgroundFallback = false;
       await armIosPipForBackground();
       if (iosPipActiveOrEntering || iosPipAutoStartArmed) {
@@ -4038,10 +4027,8 @@ ${errorStackTrace ?? ""}''');
 
   bool _iosAutoPipFallbackStartScheduled = false;
 
-  /// 兜底：系统自动启动未发生时稍后观察记录。v5 不再显式进入——
-  /// 后台显式 startPictureInPicture 被系统禁止（场景态 Background，
-  /// AVKitErrorDomain -1001），合法路径只剩系统标志与 inactive 阶段的
-  /// enterAuto（均已就位）。这里只留日志供诊断，会话保持温热会比较久。
+  /// 观察：系统自动启动未发生时记录日志供诊断。不做任何显式进入——
+  /// 合法路径只剩系统标志（已由早武装置真），会话保持温热。
   void _scheduleIosAutoPipFallbackStart() {
     if (_iosAutoPipFallbackStartScheduled) {
       return;
