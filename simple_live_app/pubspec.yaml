@@ -78,13 +78,13 @@ dependencies:
   # 因此不再使用 media_kit_libs_* 提供动态库。
   media_kit:
     git:
-      url: https://github.com/sibogentleman/media-kit.git
-      ref: 74384bd3941afbb769289e8ba086e3a776701c8e
+      url: https://github.com/Fakehiphop/media-kit.git
+      ref: 502340f746cbc00c65a5c97275eaa0c60bdc719c
       path: ./media_kit
   media_kit_video:
     git:
-      url: https://github.com/sibogentleman/media-kit.git
-      ref: 74384bd3941afbb769289e8ba086e3a776701c8e
+      url: https://github.com/Fakehiphop/media-kit.git
+      ref: 502340f746cbc00c65a5c97275eaa0c60bdc719c
       path: ./media_kit_video
 
   flutter:
