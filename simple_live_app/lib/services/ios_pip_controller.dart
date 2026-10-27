@@ -181,6 +181,20 @@ class IosPipController {
     }
   }
 
+  /// 同步锁屏/控制中心卡片标题（主播名 + 直播间标题）。
+  Future<void> updateNowPlayingInfo({String? title, String? artist}) async {
+    try {
+      await _channel.invokeMethod<void>('updateInfo', {
+        if (title != null) 'title': title,
+        if (artist != null) 'artist': artist,
+      });
+    } on PlatformException catch (error) {
+      Log.w('iOS PiP: 标题同步失败: $error');
+    } on MissingPluginException {
+      // 原生桥不可用时无法建立会话。
+    }
+  }
+
   Future<IosPipEntryResult> _enter(IosPipPlaybackState state) async {
     try {
       final supported = await _channel.invokeMethod<bool>('isSupported');
