@@ -974,6 +974,9 @@ final class IosPictureInPictureController: NSObject,
         !playing
     }
 
+    /// 显式 @objc 选择器：8a71c4b3 实测隐式推断未给该方法暴露 ObjC 入口
+    /// （构建二进制缺 selector，AVKit respondsToSelector 不命中）。
+    @objc(pictureInPictureControllerIsPlaybackBufferEmpty:)
     func pictureInPictureControllerIsPlaybackBufferEmpty(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
         // 不实现时 AVKit 自行探测缓冲，willStart 的 flush 重置后会被误判成
         // "视频还没准备好"，小窗菜单的播放按钮随之失效；显式回报缓冲状态。
