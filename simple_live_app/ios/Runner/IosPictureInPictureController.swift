@@ -71,6 +71,10 @@ final class IosPictureInPictureController: NSObject,
     private var enqueuedFrames = 0
     private var sourceFrames = 0
     private var droppedFrames = 0
+    private var dropNotReady = 0
+    private var dropPool = 0
+    private var mainHopDelaySum = 0.0
+    private var mainHopCount = 0
     private var lastStatsAt = 0.0
     // 锁屏/控制中心卡片的 Now Playing 封面：定期取一帧缩放后的缓冲。
     private var lastArtworkBuffer: CVPixelBuffer?
@@ -184,7 +188,11 @@ final class IosPictureInPictureController: NSObject,
         timer.schedule(deadline: .now(), repeating: 1.0 / 30.0)
         timer.setEventHandler { [weak self] in
             guard let self = self, self.activeFeed, let id = self.textureId else { return }
+            let scheduledAt = CACurrentMediaTime()
             DispatchQueue.main.async {
+                let hopDelay = CACurrentMediaTime() - scheduledAt
+                self.mainHopDelaySum += hopDelay
+                self.mainHopCount += 1
                 guard self.activeFeed, let buffer = self.copyPixelBuffer?(id) else { return }
                 self.onVideoFrame(buffer, textureId: id, force: true)
             }
@@ -595,6 +603,10 @@ final class IosPictureInPictureController: NSObject,
         enqueuedFrames = 0
         sourceFrames = 0
         droppedFrames = 0
+        dropNotReady = 0
+        dropPool = 0
+        mainHopDelaySum = 0
+        mainHopCount = 0
         lastStatsAt = 0
         lastArtworkBuffer = nil
         lastArtworkAt = 0
@@ -608,7 +620,16 @@ final class IosPictureInPictureController: NSObject,
             hasEnqueuedFrame = false
             layer.flush()
         }
-        guard layer.isReadyForMoreMediaData else { droppedFrames += 1; return }
+        if !force, feedPump != nil,
+           activeFeed || controller?.isPictureInPictureActive == true {
+            // 兜底泵在场时，通知驱动的拉取是重复劳动，静默跳过（不计 drop）。
+            return
+        }
+        guard layer.isReadyForMoreMediaData else {
+            droppedFrames += 1
+            dropNotReady += 1
+            return
+        }
 
         let width = CVPixelBufferGetWidth(source)
         let height = CVPixelBufferGetHeight(source)
@@ -635,22 +656,14 @@ final class IosPictureInPictureController: NSObject,
         lastEnqueueAt = now
         sourceFrames += 1
 
-        // 输出尺寸：长边上限 960；已知 PiP 实际 renderSize 时再压到它以内
-        // （PiP 窗口多大就出多大，PiliPlus `copy()` 同款）。
+        // 输出尺寸：长边上限 960，其余交给 AVSampleBufferDisplayLayer 按
+        // videoGravity 自行缩放。不跟随 PiP 窗口/纹理尺寸变化：入场动画与
+        // 首帧尺寸协商会让 outSize 漂移，逐帧重建池+flush 是掉帧源。
         var scale = 1.0
         let longEdge = max(width, height)
         let maxLongEdge = IosPictureInPictureController.maxLongEdge
         if longEdge > maxLongEdge {
             scale = Double(maxLongEdge) / Double(longEdge)
-        }
-        let displayScale = videoView?.window?.screen.scale ?? UIScreen.main.scale
-        if renderSize.width > 0, renderSize.height > 0 {
-            let targetWidth = renderSize.width * displayScale
-            let targetHeight = renderSize.height * displayScale
-            let renderScale = max(targetWidth / Double(width), targetHeight / Double(height))
-            if renderScale > 0, renderScale < scale {
-                scale = renderScale
-            }
         }
         let outWidth = max(1, Int((Double(width) * scale).rounded()))
         let outHeight = max(1, Int((Double(height) * scale).rounded()))
@@ -670,12 +683,20 @@ final class IosPictureInPictureController: NSObject,
             ]
             CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attributes as CFDictionary, &pixelBufferPool)
         }
-        guard let pool = pixelBufferPool else { return }
+        guard let pool = pixelBufferPool else {
+            droppedFrames += 1
+            dropPool += 1
+            return
+        }
         var destination: CVPixelBuffer?
         let limits = [kCVPixelBufferPoolAllocationThresholdKey: 3] as CFDictionary
         guard CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
             kCFAllocatorDefault, pool, limits, &destination) == kCVReturnSuccess,
-              let buffer = destination else { return }
+              let buffer = destination else {
+            droppedFrames += 1
+            dropPool += 1
+            return
+        }
 
         // media-kit 的后备缓冲区与引用计数无关地被复用；缩放/拷贝进有上界的
         // 缓冲池，保证 AVKit 读到的帧不会被覆盖（坑 4 的防线）。
@@ -721,7 +742,11 @@ final class IosPictureInPictureController: NSObject,
             CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
                                                         imageBuffer: buffer, formatDescriptionOut: &formatDescription)
         }
-        guard let format = formatDescription else { return }
+        guard let format = formatDescription else {
+            droppedFrames += 1
+            dropPool += 1
+            return
+        }
         // 帧投递纪律（PiliPlus 同款）：mpv 已经按自己的节奏出帧，直接要求
         // 立即显示，不再用 controlTimebase 采样 PTS 做二次节流。
         var timing = CMSampleTimingInfo(duration: .invalid,
@@ -730,7 +755,11 @@ final class IosPictureInPictureController: NSObject,
         var sample: CMSampleBuffer?
         guard CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer,
             formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample) == noErr,
-              let sample = sample else { return }
+              let sample = sample else {
+            droppedFrames += 1
+            dropPool += 1
+            return
+        }
         markDisplayImmediately(sample)
         enqueue(sample, on: layer)
         let firstFrame = !hasEnqueuedFrame
@@ -775,10 +804,19 @@ final class IosPictureInPictureController: NSObject,
     private func logFrameStats(now: Double) {
         guard now - lastStatsAt > 5.0 else { return }
         lastStatsAt = now
-        NSLog("SimpleLive PiP: frames source=%ld enqueued=%ld dropped=%ld, render %.0fx%.0f, layerStatus=%ld",
-              sourceFrames, enqueuedFrames, droppedFrames,
+        let renderer = videoView?.displayLayer.sampleBufferRenderer
+        let hopCount = mainHopCount
+        let hopAvg = hopCount > 0 ? mainHopDelaySum / Double(hopCount) * 1000.0 : 0
+        mainHopDelaySum = 0
+        mainHopCount = 0
+        NSLog("SimpleLive PiP: frames source=%ld enqueued=%ld dropped=%ld (notReady=%ld throttle=%ld pool=%ld), render %.0fx%.0f, layerStatus=%ld, rendererStatus=%ld requiresFlush=%ld, mainHop=%.1fms/%ld",
+              sourceFrames, enqueuedFrames, droppedFrames, dropNotReady,
+              droppedFrames - dropNotReady - dropPool, dropPool,
               renderSize.width, renderSize.height,
-              videoView?.displayLayer.status.rawValue ?? -1)
+              videoView?.displayLayer.status.rawValue ?? -1,
+              renderer?.status.rawValue ?? -1,
+              (renderer?.requiresFlushToResumeDecoding ?? false) ? 1 : 0,
+              hopAvg, hopCount)
     }
 
     static func hostWindow() -> UIWindow? {
@@ -798,6 +836,14 @@ final class IosPictureInPictureController: NSObject,
         // （同步定时器提前运行，绘制状态不再漂移）。
         activeFeed = true
         startFeedPump()
+        // 小窗启动即重置图层解码管线：入场会话实测过图层内部队列不消费
+        // （isReadyForMoreMediaData 长期 false，入队仅 ~11fps 抖动）；清掉
+        // 入场前保温期积压的旧样本，让泵从空管线以 30Hz 重建画面。
+        if #available(iOS 17.0, *) {
+            videoView?.displayLayer.sampleBufferRenderer.flush()
+        } else {
+            videoView?.displayLayer.flush()
+        }
         refreshNowPlayingInfo()
         NSLog("SimpleLive PiP: will start (%@)",
               suspendOnStart ? "manual + suspend" : "auto")
