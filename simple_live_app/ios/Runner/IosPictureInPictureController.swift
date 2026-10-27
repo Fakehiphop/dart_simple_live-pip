@@ -43,6 +43,7 @@ final class IosPictureInPictureController: NSObject,
     private var entryTimeout: DispatchWorkItem?
     private var entryResult: FlutterResult?
     private var startRequested = false
+    private var willStartAt: Double = 0
     private var suspendOnStart = false
     private var restoring = false
     private var textureId: Int64?
@@ -666,6 +667,10 @@ final class IosPictureInPictureController: NSObject,
         }
         lastEnqueueAt = now
         sourceFrames += 1
+        if willStartAt > 0 {
+            NSLog("SimpleLive PiP: first frame after willStart in %.0fms", (now - willStartAt) * 1000)
+            willStartAt = 0
+        }
 
         // 输出尺寸：长边上限 960，其余交给 AVSampleBufferDisplayLayer 按
         // videoGravity 自行缩放。不跟随 PiP 窗口/纹理尺寸变化：入场动画与
@@ -854,10 +859,16 @@ final class IosPictureInPictureController: NSObject,
         // 小窗启动即重置图层解码管线：入场会话实测过图层内部队列不消费
         // （isReadyForMoreMediaData 长期 false，入队仅 ~11fps 抖动）；清掉
         // 入场前保温期积压的旧样本，让泵从空管线以 30Hz 重建画面。
+        willStartAt = CACurrentMediaTime()
         if #available(iOS 17.0, *) {
             videoView?.displayLayer.sampleBufferRenderer.flush()
         } else {
             videoView?.displayLayer.flush()
+        }
+        // flush 清空管线后窗口第一瞬间无内容（入场 1-2s 卡顿的来源）：
+        // 立即补一帧让小窗出现即有画面，喂帧泵 33ms 后接管。
+        if let id = textureId, let buffer = copyPixelBuffer?(id) {
+            onVideoFrame(buffer, textureId: id, force: true)
         }
         refreshNowPlayingInfo()
         NSLog("SimpleLive PiP: will start (%@)",
@@ -869,6 +880,9 @@ final class IosPictureInPictureController: NSObject,
     func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         guard controller === pictureInPictureController else { return }
         channel.invokeMethod("onModeChanged", arguments: ["isInPipMode": true])
+        // 小窗真正 Active 时同步一次 Now Playing（rate/进度翻面），
+        // 锁屏与控制中心卡片据此从"准备中/暂停"切回"在播"。
+        refreshNowPlayingInfo()
         finishEntry(true)
     }
 
