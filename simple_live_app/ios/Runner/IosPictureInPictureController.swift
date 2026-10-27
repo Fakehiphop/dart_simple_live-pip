@@ -128,12 +128,15 @@ final class IosPictureInPictureController: NSObject,
                 self.updateNowPlayingInfo(args)
                 result(nil)
             case "dispose":
-                // 换直播间/离开直播页不再销毁会话：SpringBoard 只对已注册的
-                // Pegasus remote object 做自动起窗，每次重建 controller 都让
-                // 下一轮上滑变成"新对象赌博"。只重置帧管线状态。
+                // 离开直播页即彻底销毁（071712 实测）：softReset 常驻的会话
+                // 在 canStart=false/autoStart=false 下仍被 SpringBoard 自动起
+                // 窗（RequestingAutomaticStart x8），冻结在杂散帧上成为僵尸
+                // 小窗；而正式武装的新会话/重挂会话自动起窗 3/3 成功——常驻
+                // 无收益，是僵尸唯一来源。销毁后 arm/attach 自动空操作。
+                NSLog("SimpleLive PiP: dispose destroys session (anti-zombie)")
                 self.finishEntry(false)
-                self.softReset()
-                result(nil)
+                self.controller?.stopPictureInPicture()
+                self.cleanUp { result(nil) }
             default:
                 result(FlutterMethodNotImplemented)
             }
@@ -382,7 +385,9 @@ final class IosPictureInPictureController: NSObject,
         if UIApplication.shared.applicationState != .active, !activeFeed,
            controller?.isPictureInPictureActive != true {
             NSLog("SimpleLive PiP: attach deferred (background transition)")
-            return false
+            // 会话常驻（softReset 保留 controller），deferred attach 语义上
+            // 成功：Dart 侧按 attach ok 处理，状态同步回前台后补齐。
+            return true
         }
         guard AVPictureInPictureController.isPictureInPictureSupported(),
               let id = args["textureId"] as? NSNumber,
@@ -390,6 +395,7 @@ final class IosPictureInPictureController: NSObject,
 
         if controller == nil {
             lastAutoEnterWritten = false
+            willStartAt = 0
             let view = PipVideoView()
             view.isUserInteractionEnabled = false
             view.displayLayer.videoGravity = .resizeAspect
@@ -624,6 +630,14 @@ final class IosPictureInPictureController: NSObject,
     /// controller/displayLayer/contentSource/timebase，只重置帧管线状态；
     /// 同一直播间重新 attach 时 textureId 与渲染尺寸天然吻合。
     private func softReset() {
+        // 僵尸小窗防御（065526/070309 实测）：退出直播页过渡期，Dart 生命
+        // 周期武装与页面 dispose 竞速——系统先把 PiP 拉起，softReset 才到；
+        // 泵已停，小窗冻结在最后一帧。换页/退出后必须关掉这个失去内容源
+        // 的窗口。正常换页时 PiP 必然不在 active，此 stop 是 no-op。
+        if controller?.isPictureInPictureActive == true {
+            controller?.stopPictureInPicture()
+            NSLog("SimpleLive PiP: zombie PiP stopped on soft reset")
+        }
         sessionGeneration += 1
         clearEntryObservations()
         hasEnqueuedFrame = false
@@ -965,8 +979,14 @@ final class IosPictureInPictureController: NSObject,
         // 无条件 flush 会清空已排队样本，小窗首瞬必空 1-2 帧（860 日志用户
         // 复测"还是有一瞬间的卡顿"）；排队帧的病态自愈交给 enqueue 的
         // failed/requiresFlush 守卫即可。
-        if let id = textureId, let buffer = copyPixelBuffer?(id) {
-            onVideoFrame(buffer, textureId: id, force: true)
+        // PiliPlus 同构：willStart 只发信号不同步拷贝——窗口开启动画事务
+        // 先提交，补帧延一拍落地（泵下一跳 ≤33ms 跟上）；同步拷贝会在
+        // 动画关键段占主线程（入场"一瞬间卡顿"的剩余嫌疑）。
+        if let id = textureId {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, let buffer = self.copyPixelBuffer?(id) else { return }
+                self.onVideoFrame(buffer, textureId: id, force: true)
+            }
         }
         refreshNowPlayingInfo()
         NSLog("SimpleLive PiP: will start (%@)",
@@ -1047,6 +1067,12 @@ final class IosPictureInPictureController: NSObject,
         entryTimeout?.cancel()
         entryTimeout = nil
         startRequested = false
+        // 回到 app 即解除自动起窗资格（070309 实测主因）：小窗停掉后
+        // canStart 若保持 true，用户退出直播页后短时间内上滑，SpringBoard
+        // 仍按 TRUE 把常驻会话拉成僵尸小窗（画面冻结在最后一帧）。下一次
+        // 真上滑时 Dart 生命周期武装会重新写入 true（边沿触发）。
+        autoStartArmed = false
+        updateAutoEnterFlag()
         suspendOnStart = false
         activeFeed = false
         syncFeedPump()
