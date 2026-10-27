@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 import 'package:auto_orientation_v2/auto_orientation_v2.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:file_picker/file_picker.dart';
@@ -1201,12 +1202,20 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
         return;
       }
 
-      var imageData = await player.screenshot();
-      if (imageData == null) {
+      // fork 的 screenshot 返回 dart:ui Image，需手动编码为 PNG 字节。
+      final image = await player.screenshot();
+      if (image == null) {
         SmartDialog.showToast("截图失败,数据为空");
         SmartDialog.dismiss(status: SmartStatus.loading);
         return;
       }
+      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      if (byteData == null) {
+        SmartDialog.showToast("截图失败,编码失败");
+        SmartDialog.dismiss(status: SmartStatus.loading);
+        return;
+      }
+      final imageData = byteData.buffer.asUint8List();
 
       if (Platform.isIOS || Platform.isAndroid) {
         await ImageGallerySaverPlus.saveImage(
@@ -2151,8 +2160,7 @@ class PlayerController extends BaseController
 
   StreamSubscription<String>? _errorSubscription;
   StreamSubscription? _completedSubscription;
-  StreamSubscription? _widthSubscription;
-  StreamSubscription? _heightSubscription;
+  StreamSubscription? _sizeSubscription;
   StreamSubscription<VideoParams>? _videoParamsSubscription;
   StreamSubscription? _logSubscription;
   StreamSubscription? _playingSubscription;
@@ -2482,34 +2490,19 @@ class PlayerController extends BaseController
       Log.d("播放器日志：$event");
       _trackVideoDecodeError(event);
     });
-    _widthSubscription = player.stream.width.listen((event) {
+    // fork 的 PlayerStream 用 size（(int, int) 记录）替代 width/height 两个流。
+    _sizeSubscription = player.stream.size.listen((event) {
+      final width = event.$1;
+      final height = event.$2;
       Log.d(
-          'width:$event  W:${(player.state.width)}  H:${(player.state.height)}');
+          'size:${width}x$height  W:${(player.state.width)}  H:${(player.state.height)}');
 
       // Fix Issue #57: 检测异常的视频尺寸
-      // Windows 上纹理重建期间 width 会短暂为 null，此时触发恢复
+      // Windows 上纹理重建期间尺寸会短暂为 0，此时触发恢复
       // 会撞上渲染上下文初始化的竞态（回前台整窗冻结），仅非 Windows 生效
-      if (event == null || event <= 0) {
+      if (width <= 0 || height <= 0) {
         if (player.state.playing && !Platform.isWindows) {
-          Log.w("播放器宽度异常: $event (播放中)，可能是Surface失效");
-          unawaited(_handleInvalidVideoSize());
-        }
-        return;
-      }
-
-      isVertical.value =
-          (player.state.height ?? 9) > (player.state.width ?? 16);
-      unawaited(refreshAutoPipOnVideoSize());
-      unawaited(_syncAndroidExternalWindowLandscapeOrientation());
-    });
-    _heightSubscription = player.stream.height.listen((event) {
-      Log.d(
-          'height:$event  W:${(player.state.width)}  H:${(player.state.height)}');
-
-      // Fix Issue #57: 检测异常的视频尺寸（Windows 排除，同上）
-      if (event == null || event <= 0) {
-        if (player.state.playing && !Platform.isWindows) {
-          Log.w("播放器高度异常: $event (播放中)，可能是Surface失效");
+          Log.w("播放器尺寸异常: ${width}x$height (播放中)，可能是Surface失效");
           unawaited(_handleInvalidVideoSize());
         }
         return;
@@ -2535,8 +2528,7 @@ class PlayerController extends BaseController
     _cancelStablePlaybackTimer();
     _errorSubscription?.cancel();
     _completedSubscription?.cancel();
-    _widthSubscription?.cancel();
-    _heightSubscription?.cancel();
+    _sizeSubscription?.cancel();
     _videoParamsSubscription?.cancel();
     _backgroundEventSubscription?.cancel();
     _logSubscription?.cancel();
@@ -3145,6 +3137,16 @@ class PlayerController extends BaseController
     return result;
   }
 
+  /// fork 的 PlayerState 无 audioBitrate，改从 mpv 属性读取。
+  String _readAudioBitrate() {
+    try {
+      final value = player.getProperty('audio-bitrate').trim();
+      return value.isEmpty ? '未知' : value;
+    } catch (e) {
+      return '未知';
+    }
+  }
+
   Future<void> showDebugInfo() async {
     final mpvProperties = await _readMpvDiagnosticProperties();
     final videoTrack = player.state.track.video;
@@ -3191,7 +3193,7 @@ class PlayerController extends BaseController
           diagnosticTile('Media', player.state.playlist),
           diagnosticTile('AudioTrack', player.state.track.audio),
           diagnosticTile('VideoTrack', videoTrack),
-          diagnosticTile('AudioBitrate', player.state.audioBitrate),
+          diagnosticTile('AudioBitrate', _readAudioBitrate()),
           diagnosticTile('Volume', player.state.volume),
         ],
       ),
