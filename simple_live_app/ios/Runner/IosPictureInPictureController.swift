@@ -87,6 +87,11 @@ final class IosPictureInPictureController: NSObject,
     private var lastNowPlayingPlaying = false
     private var lastNowPlayingSynced = false
     private var lastAutoEnterWritten = false
+    // mpv 推送计数（PiliPlus 同构 "Frames are already paced by mpv"）：
+    // 泵只在计数变化时取帧——计时器节拍与 mpv 渲染异步赛跑，撞上正在写
+    // IOSurface 的瞬间会拿到半成品帧（入场"一瞬间卡顿"的最后嫌疑）。
+    private var framePushCounter = 0
+    private var lastPulledFrameCounter = -1
     // 锁屏封面（11310 同款）：每会话一次性生成 320×320 JPEG（CI 走
     // software renderer，后台 Metal 会被 BackgroundExecutionNotPermitted 拒），
     // 不再周期性整包 Replace。
@@ -198,6 +203,12 @@ final class IosPictureInPictureController: NSObject,
     /// 只有 ~4fps（PiliPlus 无泵且注释称"帧距由 mpv 决定"，其小窗流畅，
     /// 说明推送速率受环境影响）。泵按 30Hz 主动拉最新纹理帧，force 绕过
     /// 采样节流；内容未更新时拷到的是重复帧，无副作用。
+    /// frameHandler 入口（主线程，mpv 渲染完成即到达）：只计数，拷贝由泵
+    /// 队列按推送节奏执行。
+    func noteFramePush() {
+        framePushCounter += 1
+    }
+
     private func startFeedPump() {
         guard feedPump == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: feedPumpQueue)
@@ -211,6 +222,10 @@ final class IosPictureInPictureController: NSObject,
                 let hopDelay = CACurrentMediaTime() - scheduledAt
                 self.mainHopDelaySum += hopDelay
                 self.mainHopCount += 1
+                // mpv 节奏门：没有新推送就不取帧，帧到达节奏完全交给 mpv。
+                let pushed = self.framePushCounter
+                guard pushed != self.lastPulledFrameCounter else { return }
+                self.lastPulledFrameCounter = pushed
                 guard self.activeFeed || (self.autoStartArmed && self.hasEnqueuedFrame),
                       let buffer = self.copyPixelBuffer?(id) else { return }
                 self.onVideoFrame(buffer, textureId: id, force: true)
@@ -796,6 +811,12 @@ final class IosPictureInPictureController: NSObject,
         if longEdge > maxLongEdge {
             scale = Double(maxLongEdge) / Double(longEdge)
         }
+        // PiliPlus 同构（PipPlugin :353-360）：输出再按 PiP 窗口实际尺寸
+        // 收一次——小窗期每帧只搬 ~10 万像素，而非固定 960 长边的 52 万。
+        if renderSize.width > 0, renderSize.height > 0 {
+            let fit = max(renderSize.width / Double(width), renderSize.height / Double(height))
+            scale = min(scale, fit)
+        }
         let outWidth = max(1, Int((Double(width) * scale).rounded()))
         let outHeight = max(1, Int((Double(height) * scale).rounded()))
         let outSize = CGSize(width: outWidth, height: outHeight)
@@ -807,8 +828,8 @@ final class IosPictureInPictureController: NSObject,
             kCVPixelBufferMetalCompatibilityKey: true
         ]
         if pixelBufferPool == nil || pixelBufferPoolSize != outSize {
-            hasEnqueuedFrame = false
-            layer.flushAndRemoveImage()
+            // PiliPlus 同构（PipPlugin :366-377）：换池不 flush 不清标志——
+            // flush 是强制清屏，触发即卡一帧；旧池缓冲由 CF 引用计数回收。
             pixelBufferPoolSize = outSize
             formatDescription = nil
             pixelBufferPool = nil
