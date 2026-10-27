@@ -110,7 +110,7 @@ final class PipPlugin: NSObject, FlutterPlugin {
   private func tearDown() {
     session?.invalidate()
     session = nil
-    activeSession = nil
+    Self.activeSession = nil
   }
 
   /// The live session, so the lock-screen remote commands installed in
