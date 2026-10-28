@@ -412,6 +412,7 @@ class LiveRoomPage extends GetView<LiveRoomController> {
             canPop: _allowsNativePopGesture(),
             onPopInvokedWithResult: (didPop, result) async {
               if (didPop) {
+                controller.disarmIosPipForExit();
                 await controller.cancelAutoPipOnLeave();
                 return;
               }
@@ -447,6 +448,7 @@ class LiveRoomPage extends GetView<LiveRoomController> {
           canPop: _allowsNativePopGesture(),
           onPopInvokedWithResult: (didPop, result) async {
             if (didPop) {
+              controller.disarmIosPipForExit();
               await controller.cancelAutoPipOnLeave();
               return;
             }
@@ -459,6 +461,7 @@ class LiveRoomPage extends GetView<LiveRoomController> {
   }
 
   Future<void> _handleBack(BuildContext context) async {
+    controller.disarmIosPipForExit();
     await controller.cancelAutoPipOnLeave();
     if (context.mounted) {
       Navigator.of(context).pop();
