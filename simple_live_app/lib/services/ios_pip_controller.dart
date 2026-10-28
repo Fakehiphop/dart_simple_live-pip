@@ -179,7 +179,7 @@ class IosPipController {
     } on MissingPluginException {
       return false;
     }
-
+  }
 
   /// 提前解除武装：用户已表达退出意图（返回键/手势 pop/页面关闭），在
   /// dispose 异步落地前把系统 canStartPictureInPictureAutomaticallyFromInline
@@ -197,7 +197,6 @@ class IosPipController {
     } on MissingPluginException {
       // 新引擎尚未就绪，dispose 会兜底销毁
     }
-  }
   }
 
   /// 同步锁屏/控制中心卡片标题（主播名 + 直播间标题）。
