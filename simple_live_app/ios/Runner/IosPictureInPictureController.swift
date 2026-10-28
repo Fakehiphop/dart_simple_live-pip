@@ -1164,7 +1164,14 @@ final class IosPictureInPictureController: NSObject,
     /// 输出尺寸据此压缩，避免超采样；同时立刻补一帧让新窗口有画面。
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                     didTransitionToRenderSize newRenderSize: CMVideoDimensions) {
-        renderSize = CGSize(width: Int(newRenderSize.width), height: Int(newRenderSize.height))
+        // didTransitionToRenderSize 给的是小窗"逻辑点"尺寸（~406×228）：
+        // 拷贝输出必须按物理像素（×screen.scale，3x 屏 1218×684），否则
+        // 小窗只拿到约 1/9 分辨率、画面发糊。宽高比不变，镜像布局不受影响。
+        let scale = videoView?.window?.screen.scale ?? UIScreen.main.scale
+        renderSize = CGSize(
+            width: max(1, Int((CGFloat(newRenderSize.width) * scale).rounded())),
+            height: max(1, Int((CGFloat(newRenderSize.height) * scale).rounded()))
+        )
         lastEnqueueAt = 0
         layoutVideoView()
         if let id = textureId, let buffer = copyPixelBuffer?(id) {
