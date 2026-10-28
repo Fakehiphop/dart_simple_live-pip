@@ -1,39 +1,32 @@
 import CoreVideo
 import Flutter
 import UIKit
-import media_kit_video
 
-// 基于 Kazumi PR #2646（sibogentleman）的实现移植。
-// 该插件通过 FlutterPluginRegistry 发布这份类型化 API。它拥有输出的配置与替换；
-// 应用层负责 mpv 视频轨道的挂起与恢复。
-protocol PipRendering: AnyObject {
-    var softwareRenderingHandles: [Int64] { get }
-    func setSoftwareRenderingForNewOutputs(_ enabled: Bool)
-    func setSoftwareRendering(handle: Int64, enabled: Bool,
-                              completion: @escaping (VideoOutputRenderingResult) -> Void)
-}
-
-extension MediaKitVideoPlugin: PipRendering {}
-
+// 通过 Flutter 公开纹理 API 观察帧（PiliPlus TextureTracker 的等价实现，
+// 但用的是公开注册表包装而非 ObjC runtime hook）。
+//
+// 本轮只保留两件事：
+//   1. 把 media-kit 注册的纹理包一层，在 `textureFrameAvailable` 时抓一份
+//      最新像素缓冲交给 iOS 画中画控制器；
+//   2. 其余注册表接口原样转发。
+//
+// 软件渲染切换（原 Kazumi PR #2646 的 setSoftwareRendering / restoreRendering
+// 一整套机制）已整体移除：渲染后端全程恒定，后台出帧靠 audio 后台模式维持
+// 进程与主队列存活（PiliPlus 同构）。
 private final class PipTextureRegistry: NSObject, FlutterTextureRegistry {
     private let registry: FlutterTextureRegistry
     private let frameHandler: (CVPixelBuffer, Int64) -> Void
-    private let onRegistered: () -> Void
     private var textures: [Int64: FlutterTexture] = [:]
 
-    init(registry: FlutterTextureRegistry, frameHandler: @escaping (CVPixelBuffer, Int64) -> Void,
-         onRegistered: @escaping () -> Void) {
+    init(registry: FlutterTextureRegistry, frameHandler: @escaping (CVPixelBuffer, Int64) -> Void) {
         self.registry = registry
         self.frameHandler = frameHandler
-        self.onRegistered = onRegistered
         super.init()
     }
 
     func register(_ texture: FlutterTexture) -> Int64 {
         let textureId = registry.register(texture)
         textures[textureId] = texture
-        // 插件在 register 返回后才算完成初始化。重试此前遇到新输出忙的前台恢复。
-        DispatchQueue.main.async(execute: onRegistered)
         return textureId
     }
 
@@ -105,52 +98,23 @@ private final class PipRegistrar: NSObject, FlutterPluginRegistrar {
     }
 }
 
-// 通过 Flutter 公开纹理 API 观察帧。插件方法委托原样转发；
-// 渲染器切换使用 media-kit 发布的 API。
+// 包住真实的 FlutterPluginRegistry，只为 MediaKitVideoPlugin 换掉纹理注册表。
 final class PipPluginRegistry: NSObject, FlutterPluginRegistry {
     private let registry: FlutterPluginRegistry
     private let frameHandler: (CVPixelBuffer, Int64) -> Void
-    private let renderingOverride: PipRendering?
-    private let isForeground: () -> Bool
     private var videoRegistrar: PipRegistrar?
-    private var recreatingHandles: Set<Int64> = []
-    private var waitingForRegistration: Set<Int64> = []
-    private var registrationGeneration: UInt = 0
-    private var restorationCompletions: [() -> Void] = []
-    private var softwareRendering = false
-
-    var videoOutputWillChange: ((Int64, @escaping (Bool) -> Void) -> Void)?
-    var videoOutputDidChange: ((Int64, Bool, @escaping (Bool) -> Void) -> Void)?
-
-    private var renderer: PipRendering? {
-        renderingOverride ?? registry.valuePublished(byPlugin: "MediaKitVideoPlugin") as? MediaKitVideoPlugin
-    }
 
     init(registry: FlutterPluginRegistry,
-         rendering: PipRendering? = nil,
-         isForeground: @escaping () -> Bool = { UIApplication.shared.applicationState == .active },
          frameHandler: @escaping (CVPixelBuffer, Int64) -> Void) {
         self.registry = registry
         self.frameHandler = frameHandler
-        self.renderingOverride = rendering
-        self.isForeground = isForeground
         super.init()
-        NotificationCenter.default.addObserver(self, selector: #selector(restoreIfForeground),
-                                               name: UIApplication.didBecomeActiveNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(restoreIfForeground),
-                                               name: UIScene.didActivateNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(protectBackgroundOutputs),
-                                               name: UIApplication.didEnterBackgroundNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(protectBackgroundOutputs),
-                                               name: UIScene.didEnterBackgroundNotification, object: nil)
     }
 
     func registrar(forPlugin pluginKey: String) -> FlutterPluginRegistrar? {
         guard let registrar = registry.registrar(forPlugin: pluginKey) else { return nil }
         guard pluginKey == "MediaKitVideoPlugin" else { return registrar }
-        let textures = PipTextureRegistry(registry: registrar.textures(), frameHandler: frameHandler) { [weak self] in
-            self?.textureRegistered()
-        }
+        let textures = PipTextureRegistry(registry: registrar.textures(), frameHandler: frameHandler)
         let adapter = PipRegistrar(registrar: registrar, textureRegistry: textures)
         videoRegistrar = adapter
         return adapter
@@ -163,104 +127,5 @@ final class PipPluginRegistry: NSObject, FlutterPluginRegistry {
 
     func copyPixelBuffer(forTexture textureId: Int64) -> CVPixelBuffer? {
         videoRegistrar?.textureRegistry.copyPixelBuffer(forTexture: textureId)
-    }
-
-    private func changeRendering(_ handle: Int64, software: Bool,
-                                 completion: @escaping (Bool) -> Void) {
-        guard !recreatingHandles.contains(handle), let renderer = renderer,
-              let willChange = videoOutputWillChange,
-              let didChange = videoOutputDidChange else { completion(false); return }
-        recreatingHandles.insert(handle)
-        var retryGeneration: UInt?
-        let finish: (Bool) -> Void = { ready in
-            self.recreatingHandles.remove(handle)
-            completion(ready)
-            // 关闭画中画可能与进入竞争。在其轨道恢复之后、向 Dart 确认原生会话
-            // 释放之前执行恢复。
-            if software && !self.softwareRendering && self.isForeground() {
-                self.restoreIfForeground()
-            } else if let generation = retryGeneration,
-                      generation != self.registrationGeneration {
-                self.retryRegisteredOutputs()
-            }
-            self.finishRestorationIfIdle()
-        }
-        willChange(handle) { suspended in
-            guard suspended else { finish(false); return }
-            // 挂起跨越 Dart 通道。等待期间应用可能已退后台或开始了另一个画中画会话。
-            guard software || (!self.softwareRendering && self.isForeground()) else {
-                renderer.setSoftwareRenderingForNewOutputs(true)
-                didChange(handle, false) { _ in finish(false) }
-                return
-            }
-            renderer.setSoftwareRendering(handle: handle, enabled: software) { result in
-                if !software && result == .notReady {
-                    self.waitingForRegistration.insert(handle)
-                    retryGeneration = self.registrationGeneration
-                } else {
-                    self.waitingForRegistration.remove(handle)
-                }
-                // 即使失败或未变化也必须恢复轨道。
-                // 依赖项只有在输出工作排空后才完成。
-                didChange(handle, result == .changed) { resumed in
-                    finish((result == .changed || result == .unchanged) && resumed)
-                }
-            }
-        }
-    }
-
-    func useSoftwareRendering(forHandle handle: Int64, completion: @escaping (Bool) -> Void) {
-        guard let renderer = renderer else { completion(false); return }
-        softwareRendering = true
-        // 画中画激活期间新建的替换播放器也必须避开 GL。
-        renderer.setSoftwareRenderingForNewOutputs(true)
-        changeRendering(handle, software: true, completion: completion)
-    }
-
-    func restoreRendering(completion: @escaping () -> Void) {
-        softwareRendering = false
-        restorationCompletions.append(completion)
-        restoreIfForeground()
-        finishRestorationIfIdle()
-    }
-
-    private func finishRestorationIfIdle() {
-        guard recreatingHandles.isEmpty else { return }
-        let completions = restorationCompletions
-        restorationCompletions.removeAll()
-        completions.forEach { $0() }
-    }
-
-    @objc private func restoreIfForeground() {
-        guard !softwareRendering, isForeground(), let renderer = renderer else { return }
-        renderer.setSoftwareRenderingForNewOutputs(false)
-        for handle in renderer.softwareRenderingHandles where !recreatingHandles.contains(handle) {
-            changeRendering(handle, software: false) { _ in }
-        }
-    }
-
-    private func textureRegistered() {
-        registrationGeneration &+= 1
-        retryRegisteredOutputs()
-    }
-
-    private func retryRegisteredOutputs() {
-        guard !softwareRendering, isForeground(), let renderer = renderer else { return }
-        let liveHandles = Set(renderer.softwareRenderingHandles)
-        waitingForRegistration.formIntersection(liveHandles)
-        for handle in waitingForRegistration where !recreatingHandles.contains(handle) {
-            waitingForRegistration.remove(handle)
-            changeRendering(handle, software: false) { _ in }
-        }
-    }
-
-    @objc private func protectBackgroundOutputs() {
-        guard let renderer = renderer,
-              softwareRendering || !renderer.softwareRenderingHandles.isEmpty || !recreatingHandles.isEmpty else { return }
-        renderer.setSoftwareRenderingForNewOutputs(true)
-    }
-
-    deinit {
-        NotificationCenter.default.removeObserver(self)
     }
 }
