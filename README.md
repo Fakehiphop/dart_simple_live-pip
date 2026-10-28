@@ -61,8 +61,8 @@
 
 ## 参考实现
 
-- [PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus) —— 原生 iOS 画中画插件（`PipPlugin`）的整体结构与本项目同构，本项目的实现参照其思路。
-- [SwiftPeek](https://github.com/Rladmsrl/SwiftPeek) —— 同类 iOS 直播画中画方案（GPL-3.0）。本项目的帧调度与像素搬运未参考该仓库。
+- [PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus) —— 原生 iOS 画中画插件（`PipPlugin`）的整体结构与本项目同构。
+- [SwiftPeek](https://github.com/Rladmsrl/SwiftPeek)
 
 ---
 
