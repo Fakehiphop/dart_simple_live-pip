@@ -179,6 +179,25 @@ class IosPipController {
     } on MissingPluginException {
       return false;
     }
+
+
+  /// 提前解除武装：用户已表达退出意图（返回键/手势 pop/页面关闭），在
+  /// dispose 异步落地前把系统 canStartPictureInPictureAutomaticallyFromInline
+  /// 压回 false——否则退后台判定仍会拉起小窗、销毁落地后再拆掉（僵尸闪现，
+  /// 见 11314 竞速分析）。native 侧同时停掉喂帧泵。
+  Future<void> disarm() async {
+    if (!_ownsPage) return;
+    try {
+      await _channel.invokeMethod<bool>(
+        'setAutoStartEnabled',
+        {'enabled': false},
+      );
+    } on PlatformException catch (error) {
+      Log.w('iOS PiP: 解除武装失败: $error');
+    } on MissingPluginException {
+      // 新引擎尚未就绪，dispose 会兜底销毁
+    }
+  }
   }
 
   /// 同步锁屏/控制中心卡片标题（主播名 + 直播间标题）。
