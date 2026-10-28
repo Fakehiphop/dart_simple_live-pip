@@ -194,15 +194,14 @@ final class IosPictureInPictureController: NSObject,
         refreshNowPlayingInfo()
     }
 
-    /// 喂帧兜底泵（PiliPlus 同构改造）：帧的主驱动 = mpv 渲染完成通知
-    /// （textureFrameAvailable 回调，帧距由 mpv 决定，每次拿到的 IOSurface
-    /// 必然完整）。泵只做推送链心跳检测：距上帧入队 >0.3s 才补拉一帧
-    /// ——不再按 30Hz 与 mpv 渲染赛跑（计时器撞上 mpv 正写 IOSurface 的
-    /// 瞬间会拷到半成品帧，入场闪一下的来源之一）。
+    /// 喂帧兜底泵：对照实验里 mpv→textureFrameAvailable 推送链在后台实测
+    /// 只有 ~4fps（PiliPlus 无泵且注释称"帧距由 mpv 决定"，其小窗流畅，
+    /// 说明推送速率受环境影响）。泵按 30Hz 主动拉最新纹理帧，force 绕过
+    /// 采样节流；内容未更新时拷到的是重复帧，无副作用。
     private func startFeedPump() {
         guard feedPump == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: feedPumpQueue)
-        timer.schedule(deadline: .now(), repeating: 1.0 / 10.0)
+        timer.schedule(deadline: .now(), repeating: 1.0 / 30.0)
         timer.setEventHandler { [weak self] in
             guard let self = self,
                   self.activeFeed || (self.autoStartArmed && self.hasEnqueuedFrame),
@@ -212,16 +211,14 @@ final class IosPictureInPictureController: NSObject,
                 let hopDelay = CACurrentMediaTime() - scheduledAt
                 self.mainHopDelaySum += hopDelay
                 self.mainHopCount += 1
-                // 心跳检测：推送链活着（上帧 <0.3s 前）就零开销让行。
                 guard self.activeFeed || (self.autoStartArmed && self.hasEnqueuedFrame),
-                      CACurrentMediaTime() - self.lastEnqueueAt > 0.3,
                       let buffer = self.copyPixelBuffer?(id) else { return }
                 self.onVideoFrame(buffer, textureId: id, force: true)
             }
         }
         timer.resume()
         feedPump = timer
-        NSLog("SimpleLive PiP: feed pump started (heartbeat)")
+        NSLog("SimpleLive PiP: feed pump started (30Hz)")
     }
 
     private func stopFeedPump() {
@@ -725,6 +722,11 @@ final class IosPictureInPictureController: NSObject,
             hasEnqueuedFrame = false
             layer.flush()
         }
+        if !force, feedPump != nil {
+            // 兜底泵在场时（PiP 活跃或武装窗口），通知驱动的拉取是重复劳动，
+            // 统一由泵按 30Hz 喂，静默跳过（不计 drop）。
+            return
+        }
         guard layer.isReadyForMoreMediaData else {
             droppedFrames += 1
             dropNotReady += 1
@@ -788,13 +790,9 @@ final class IosPictureInPictureController: NSObject,
             }
         }
 
-        // 输出尺寸：固定 min(960, 源长边)，绝不跟 renderSize（PiP 窗口逻辑点）
-        // 走。11316 实测 6 份崩溃 ips 同栈定案：outSize 随 renderSize 振荡 →
-        // 每帧新尺寸 sample → AVKit setEnqueuedBufferDimensions KVO →
-        // contentSourceVideoRectInWindowChanged → Pegasus proxy os_log 打
-        // CGRect → 再触发尺寸重估 → ~20 圈后 ___chkstk 栈溢出。且逻辑点尺寸
-        // 未乘屏幕 scale，物理像素不足（用户实拍画质糊）。outSize 恒定后
-        // enqueuedBufferDimensions 只在首帧变一次，环不迭代（11314/11315 从未崩）。
+        // 输出尺寸：长边上限 960，其余交给 AVSampleBufferDisplayLayer 按
+        // videoGravity 自行缩放。不跟随 PiP 窗口/纹理尺寸变化：入场动画与
+        // 首帧尺寸协商会让 outSize 漂移，逐帧重建池+flush 是掉帧源。
         var scale = 1.0
         let longEdge = max(width, height)
         let maxLongEdge = IosPictureInPictureController.maxLongEdge
@@ -812,11 +810,8 @@ final class IosPictureInPictureController: NSObject,
             kCVPixelBufferMetalCompatibilityKey: true
         ]
         if pixelBufferPool == nil || pixelBufferPoolSize != outSize {
-            // 换池不 flush（PiliPlus 同构）：旧池的帧继续显示，新池首帧自然
-            // 接上；flushAndRemoveImage 是一次强制清屏（入场/进出小窗闪一下
-            // 的来源）。formatDescription 随新尺寸重建，sample 自带 format
-            // 引用，layer 自动适应。hasEnqueuedFrame 不动——帧管线只是换池，
-            // 不是没帧，canStart 标志保持连续。
+            hasEnqueuedFrame = false
+            layer.flushAndRemoveImage()
             pixelBufferPoolSize = outSize
             formatDescription = nil
             pixelBufferPool = nil
