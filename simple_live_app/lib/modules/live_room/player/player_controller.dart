@@ -1470,6 +1470,15 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
   }
 
   Future<void> cancelAutoPipOnLeave() async {
+    if (Platform.isIOS) {
+      // 退出直播页的瞬间（pop 请求即刻，早于 onClose 的 await 链）解除
+      // 自动起窗武装：原生 canStartPictureInPictureAutomaticallyFromInline
+      // 立即写 false，用户随后上滑切桌面时系统不再拉窗，堵死"退出→切桌面"
+      // 竞速产生的僵尸小窗（拉起后随 dispose 销毁闪现即逝）。
+      _iosPipAutoStartArmed = false;
+      _iosPip?.disarm();
+      return;
+    }
     if (!Platform.isAndroid) {
       return;
     }

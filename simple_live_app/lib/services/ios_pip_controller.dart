@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/services.dart';
 import 'package:simple_live_app/app/log.dart';
 import 'package:simple_live_app/services/async_single_flight.dart';
@@ -178,6 +180,33 @@ class IosPipController {
       return false;
     } on MissingPluginException {
       return false;
+    }
+  }
+
+  /// 解除自动起窗武装（页面退出瞬间调用，先于 dispose 通道消息）：
+  /// 原生立即把 canStartPictureInPictureAutomaticallyFromInline 写 false，
+  /// 关掉"退出→切桌面"竞速窗口——否则用户上滑时系统照常拉窗，随后
+  /// dispose 到达销毁会话，小窗闪现即逝（僵尸小窗）。
+  /// fire-and-forget：不等回执，保证此消息先于 dispose 落地生效。
+  void disarm() {
+    unawaited(
+      _channel
+          .invokeMethod<bool>('setAutoStartEnabled', {'enabled': false})
+          .catchError((Object _) => false),
+    );
+  }
+
+  /// 同步锁屏/控制中心卡片标题（主播名 + 直播间标题）。
+  Future<void> updateNowPlayingInfo({String? title, String? artist}) async {
+    try {
+      await _channel.invokeMethod<void>('updateInfo', {
+        if (title != null) 'title': title,
+        if (artist != null) 'artist': artist,
+      });
+    } on PlatformException catch (error) {
+      Log.w('iOS PiP: 标题同步失败: $error');
+    } on MissingPluginException {
+      // 原生桥不可用时无法建立会话。
     }
   }
 
