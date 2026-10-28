@@ -948,13 +948,14 @@ final class IosPictureInPictureController: NSObject,
                         guard let self = self, self.sessionGeneration == gen,
                               self.enteredBackground,
                               UIApplication.shared.applicationState == .background,
-                              !self.isPictureInPictureActive,
-                              self.isPictureInPicturePossible,
+                              let pip = self.controller,
+                              pip.isPictureInPicturePossible,
+                              !pip.isPictureInPictureActive,
                               self.hasEnqueuedFrame,
                               !self.startRequested else { return }
                         self.startRequested = true
                         NSLog("SimpleLive PiP: background retry #\(attempt) after -1001")
-                        self.pip.startPictureInPicture()
+                        pip.startPictureInPicture()
                     }
                 }
             }
