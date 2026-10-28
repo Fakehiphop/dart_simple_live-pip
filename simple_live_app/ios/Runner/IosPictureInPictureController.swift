@@ -109,9 +109,13 @@ final class IosPictureInPictureController: NSObject,
             case "setAutoStartEnabled":
                 self.setAutoStartEnabled(args["enabled"] as? Bool == true, result: result)
             case "dispose":
+                // 换直播间/离开播放页都不销毁会话：armed 已复位，系统不会
+                // 在非播放页误起窗；下一个播放页复用同一 remote object，
+                // 绕开"新对象首滑 SpringBoard 不发起"的坑。彻底清理由
+                // 系统侧关闭（didStop 非 restored 分支）兜底。
                 self.finishEntry(false)
-                self.controller?.stopPictureInPicture()
-                self.cleanUp { result(nil) }
+                self.softReset()
+                result(nil)
             default:
                 result(FlutterMethodNotImplemented)
             }
@@ -585,6 +589,47 @@ final class IosPictureInPictureController: NSObject,
         if let error = error { result?(error) } else { result?(entered) }
     }
 
+    /// 换直播间软重置：SpringBoard 只对"已经见过的" Pegasus remote object
+    /// 在离场期自动发起 PiP（真机 052807：老对象判定 YES→Idle→
+    /// RequestingAutomaticStart→Active；新建对象判定 YES 数十次也不发起，
+    /// app 侧 inactive/background 主动 start 一律 AVKitErrorDomain -1001）。
+    /// 每次换房销毁重建 controller 会把每个新直播间都变成"新对象首滑"。
+    /// 因此跨房保留 controller/displayLayer/contentSource/timebase，只清
+    /// 帧管线与武装态；新页面 attach 时 textureId 与渲染尺寸自然接上。
+    private func softReset() {
+        sessionGeneration += 1
+        clearEntryObservations()
+        hasEnqueuedFrame = false
+        autoStartArmed = false
+        updateAutoEnterFlag()
+        videoView?.displayLayer.flushAndRemoveImage()
+        renderSize = .zero
+        pixelBufferPool = nil
+        pixelBufferPoolSize = .zero
+        formatDescription = nil
+        startRequested = false
+        suspendOnStart = false
+        activeFeed = false
+        stopFeedPump()
+        stopRequested = false
+        enteredBackground = false
+        restoring = false
+        lastEnqueueAt = 0
+        enqueuedFrames = 0
+        sourceFrames = 0
+        droppedFrames = 0
+        dropNotReady = 0
+        dropPool = 0
+        mainHopDelaySum = 0
+        mainHopCount = 0
+        lastStatsAt = 0
+        lastArtworkBuffer = nil
+        lastArtworkRequested = false
+        lastNowPlayingPlaying = false
+        lastNowPlayingSynced = false
+        NSLog("SimpleLive PiP: soft reset (session kept across rooms)")
+    }
+
     private func cleanUp(completion: @escaping () -> Void = {}) {
         sessionGeneration += 1
         clearEntryObservations()
@@ -879,6 +924,14 @@ final class IosPictureInPictureController: NSObject,
         if autoStartArmed {
             activeFeed = false
             suspendOnStart = false
+            // 失败即释放 startRequested：真机 052807 实测 resign 兜底发起的
+            // start 在 inactive 态被 -1001 拒后，startRequested 残留把 0.5s
+            // 后台兜底互斥挡死（fallback skipped startReq=true），双保险变
+            // 双失效。释放后后台兜底与 -1001 重试链仍可补试。
+            if startRequested, !restoring {
+                startRequested = false
+                NSLog("SimpleLive PiP: startRequested released after failure (retry chain armed)")
+            }
             return
         }
         cleanUp()
