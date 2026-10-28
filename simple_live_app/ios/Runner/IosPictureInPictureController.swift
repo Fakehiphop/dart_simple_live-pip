@@ -42,6 +42,7 @@ final class IosPictureInPictureController: NSObject,
     private var entryTimeout: DispatchWorkItem?
     private var entryResult: FlutterResult?
     private var startRequested = false
+    private var startRetries = 0
     private var willStartAt: Double = 0
     private var suspendOnStart = false
     private var restoring = false
@@ -608,6 +609,7 @@ final class IosPictureInPictureController: NSObject,
         pixelBufferPoolSize = .zero
         formatDescription = nil
         startRequested = false
+        startRetries = 0
         suspendOnStart = false
         activeFeed = false
         stopFeedPump()
@@ -897,6 +899,7 @@ final class IosPictureInPictureController: NSObject,
 
     func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         guard controller === pictureInPictureController else { return }
+        startRetries = 0
         channel.invokeMethod("onModeChanged", arguments: ["isInPipMode": true])
         // 小窗真正 Active 时同步一次 Now Playing（rate/进度翻面），
         // 锁屏与控制中心卡片据此从"准备中/暂停"切回"在播"。
@@ -931,6 +934,29 @@ final class IosPictureInPictureController: NSObject,
             if startRequested, !restoring {
                 startRequested = false
                 NSLog("SimpleLive PiP: startRequested released after failure (retry chain armed)")
+            }
+            // 冷却窗口应对：SpringBoard 在 PiP 停止后约 3-5s 内压制一切起窗
+            // （052807 实锤：判定全 YES 仍不发起，显式 start 也被 -1001 拒；
+            // 用户 5s/轮快测全败，隔 8s 成功；PiliPlus"100%"源于长观看节奏
+            // 远离冷却窗口）。失败后每秒重试，等窗口过期自动补起。
+            if failure.domain == AVKitErrorDomain, failure.code == -1001 {
+                startRetries += 1
+                let gen = sessionGeneration
+                let attempt = startRetries
+                if attempt <= 10 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        guard let self = self, self.sessionGeneration == gen,
+                              self.enteredBackground,
+                              UIApplication.shared.applicationState == .background,
+                              !self.isPictureInPictureActive,
+                              self.isPictureInPicturePossible,
+                              self.hasEnqueuedFrame,
+                              !self.startRequested else { return }
+                        self.startRequested = true
+                        NSLog("SimpleLive PiP: background retry #\(attempt) after -1001")
+                        self.pip.startPictureInPicture()
+                    }
+                }
             }
             return
         }
