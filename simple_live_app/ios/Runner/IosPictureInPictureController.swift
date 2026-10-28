@@ -149,10 +149,22 @@ final class IosPictureInPictureController: NSObject,
               playing ? "true" : "false",
               hasEnqueuedFrame ? "true" : "false",
               enqueuedFrames)
-        // 不做任何硬闯：合法路径只有系统自动启动（标志 + 帧）。
-        // 若此处仍未武装，只记录观察日志，供真机定位。
-        if !pip.canStartPictureInPictureAutomaticallyFromInline {
-            NSLog("SimpleLive PiP: backgrounded without armed auto-start (no automatic PiP expected)")
+        // 系统自动起窗只在 willResignActive 期查询一次；上滑过快或系统未查询时
+        // didEnterBackground 会带着 armed 标志空进后台（真机日志：active=false、
+        // hasFrame=true、possible=true 却无人调 start）。后台宽限期内补一发主动 start
+        // 兜底：成功例此际已 Active，条件被排除；失败例就此把小窗救回来。
+        if !pip.isPictureInPictureActive, pip.isPictureInPicturePossible,
+           pip.canStartPictureInPictureAutomaticallyFromInline || autoStartArmed {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self = self, self.enteredBackground,
+                      UIApplication.shared.applicationState == .background,
+                      let pip = self.controller,
+                      !pip.isPictureInPictureActive, !self.startRequested,
+                      self.hasEnqueuedFrame, pip.isPictureInPicturePossible else { return }
+                self.startRequested = true
+                NSLog("SimpleLive PiP: background fallback startPictureInPicture issued (auto-start missed)")
+                pip.startPictureInPicture()
+            }
         }
     }
 
