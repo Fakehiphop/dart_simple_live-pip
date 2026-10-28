@@ -58,8 +58,6 @@ class IosPipController {
   IosPipController({
     required this.playbackState,
     required this.playerHandle,
-    required this.suspendVideo,
-    required this.resumeVideo,
     required this.onPlay,
     required this.onPause,
     required this.onSeek,
@@ -72,9 +70,6 @@ class IosPipController {
 
   final IosPipPlaybackState Function() playbackState;
   final Future<int?> Function() playerHandle;
-  final Future<bool> Function(int handle) suspendVideo;
-  final Future<bool> Function(int handle, {required bool waitForTexture})
-      resumeVideo;
   final Future<void> Function() onPlay;
   final Future<void> Function() onPause;
   final Future<void> Function(Duration position) onSeek;
@@ -127,7 +122,7 @@ class IosPipController {
       if (!await _bridge.acquireNative(this) || !_ownsPage) {
         return false;
       }
-      // handle 供原生在 PiP 启动后切换软件渲染用。
+      // handle 用于原生定位 PiP 输出；渲染后端全程恒定，不再用于切软件渲染。
       final handle = await playerHandle();
       if (!_ownsPage) return false;
       final attachArgs = <String, Object>{
@@ -150,9 +145,9 @@ class IosPipController {
     }
   }
 
-  /// 退后台收尾（inactive 阶段调用）。v3 全程保持 GPU 渲染管线，
-  /// 无需切换软件渲染（帧管线未进小窗时也以 4fps 保温），这里只在
-  /// 进入后台前同步一次最新播放状态。
+  /// 退后台收尾（inactive 阶段调用）：同步一次最新播放状态，确保
+  /// canStartPictureInPictureAutomaticallyFromInline 的判定有新鲜帧与正确时基。
+  /// 渲染后端全程恒定，无渲染器切换。
   Future<bool> prepareForBackground() async {
     if (!_ownsPage) return false;
     if (_active) return true;
@@ -172,14 +167,14 @@ class IosPipController {
     }
   }
 
-  /// inactive 阶段的显式启动（v4）：早武装后重活已就绪，inactive 时刻
-  /// 只余一行 start 调用。返回是否发出（会话未就绪/已在活动时为 false）。
+  /// 武装确认（inactive/paused 阶段调用）：只保证原生侧"已武装 + 标志为真 +
+  /// 有帧"，真正的起窗由 SpringBoard 在退后台瞬间完成。返回原生是否确认就绪。
   Future<bool> requestAutoEnter() async {
     if (!_ownsPage || _active || _entry.isRunning) return false;
     try {
       return await _channel.invokeMethod<bool>('enterAuto') ?? false;
     } on PlatformException catch (error) {
-      Log.w('iOS PiP: 显式启动失败: $error');
+      Log.w('iOS PiP: 武装确认失败: $error');
       return false;
     } on MissingPluginException {
       return false;
@@ -196,9 +191,7 @@ class IosPipController {
       }
       final handle = await playerHandle();
       if (!_ownsPage) return IosPipEntryResult.failed;
-      // v5：手动路径同样把渲染句柄带给原生——否则 WillStart 后软件渲染
-      // 切换无 handle 可切（日志实证 "post-start software switch skipped
-      // (no handle/renderer)"），小窗在后台 GPU 停摆后冻结在最后一帧。
+      // 手动路径同样把渲染句柄带给原生（诊断/定位用）。
       final attachArgs = <String, Object>{
         ...state.toArguments(),
         if (handle != null) 'handle': handle,
@@ -207,7 +200,7 @@ class IosPipController {
           await _channel.invokeMethod<bool>('attach', attachArgs);
       if (!_ownsPage) return IosPipEntryResult.failed;
       if (attached != true) return IosPipEntryResult.notReady;
-      // v3：不再切换软件渲染，直接进入——管线全程温热，启动近乎即时。
+      // 手动进入：直接 startPictureInPicture（自动路径不调这个通道）。
       final entered = await _channel.invokeMethod<bool>('enter');
       if (!_ownsPage) return IosPipEntryResult.failed;
       _active = entered == true;
@@ -239,32 +232,15 @@ class IosPipController {
   Future<Object?> _handleMethodCall(MethodCall call) async {
     final args = call.arguments is Map ? call.arguments as Map : const {};
     switch (call.method) {
-      case 'onVideoOutputWillChange':
-        final handle = args['handle'];
-        return handle is int ? await suspendVideo(handle) : false;
-      case 'onVideoOutputDidChange':
-        final handle = args['handle'];
-        return handle is int
-            ? await resumeVideo(
-                handle,
-                waitForTexture: args['waitForTexture'] != false,
-              )
-            : false;
       case 'onModeChanged':
         if (!_ownsPage) return null;
         // 原生仅在真实 PiP 启动时发 isInPipMode=true；自动启动路径
-        // （_inactive 显式 start/系统标志）同样必须接住，否则 Dart 状态
-        // 失同步、新纹理 ID 无法回传。不要用 keepPlaybackInBackground
-        // 门拦——自动路径此时 _active/_entry/_arm 均可能为空。
+        // （SpringBoard 依 canStartPictureInPictureAutomaticallyFromInline
+        // 拉起）同样必须接住，否则 Dart 状态失同步。
         _active = args['isInPipMode'] == true;
         onModeChanged(_active, args['restored'] == true);
       case 'onRestore':
         return _ownsPage && canRestore();
-      case 'onSoftwareSwitchReady':
-        // v4：小窗启动后的软件渲染切换完成，新纹理 ID 已产生，
-        // 立即同步状态（否则要等 1 秒周期的定时器；synchronize 自带
-        // keepPlaybackInBackground 与 ownsNative 守卫）。
-        await synchronize();
       case 'onAction':
         if (!keepPlaybackInBackground) return null;
         switch (args['action']) {
@@ -358,14 +334,10 @@ class _IosPipChannelBridge {
       (_nativeOwner == null && isCurrent(owner));
 
   Future<Object?> handleMethodCall(MethodCall call) async {
-    final outputChange =
-        call.method == 'onVideoOutputWillChange' ||
-        call.method == 'onVideoOutputDidChange';
-    final owner = outputChange ? (_nativeOwner ?? _current) : _current;
+    final owner = _current;
     if (owner == null) return false;
     // 排空中的原生会话发出的播放命令不能到达正在等待获取会话的新页面。
-    if (!outputChange &&
-        (_nativeOwner != null && !identical(_nativeOwner, owner))) {
+    if (_nativeOwner != null && !identical(_nativeOwner, owner)) {
       return false;
     }
     return owner._handleMethodCall(call);

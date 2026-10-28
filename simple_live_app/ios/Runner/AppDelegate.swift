@@ -159,8 +159,9 @@ import AVFoundation
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     if #available(iOS 15.0, *) {
-      // iOS 画中画：包装插件注册表截获 media-kit 的纹理帧，
-      // 并通过 media-kit 发布的渲染模式接口在画中画期间切软件输出。
+      // iOS 画中画：包装插件注册表截获 media-kit 的纹理帧，交给原生
+      // PiP 控制器喂给 AVSampleBufferDisplayLayer。渲染后端全程恒定，
+      // 不再接线软件渲染切换（PiliPlus 同构）。
       let pip = IosPictureInPictureController(messenger: engineBridge.applicationRegistrar.messenger())
       let registry = PipPluginRegistry(registry: engineBridge.pluginRegistry) {
         [weak pip] buffer, textureId in
@@ -168,22 +169,6 @@ import AVFoundation
       }
       pip.copyPixelBuffer = { [weak registry] textureId in
         registry?.copyPixelBuffer(forTexture: textureId)
-      }
-      pip.useSoftwareRendering = { [weak registry] handle, completion in
-        guard let registry = registry else { completion(false); return }
-        registry.useSoftwareRendering(forHandle: handle, completion: completion)
-      }
-      pip.restoreRendering = { [weak registry] completion in
-        guard let registry = registry else { completion(); return }
-        registry.restoreRendering(completion: completion)
-      }
-      registry.videoOutputWillChange = { [weak pip] handle, completion in
-        guard let pip = pip else { completion(false); return }
-        pip.videoOutputWillChange(handle, completion: completion)
-      }
-      registry.videoOutputDidChange = { [weak pip] handle, waitForTexture, completion in
-        guard let pip = pip else { completion(false); return }
-        pip.videoOutputDidChange(handle, waitForTexture: waitForTexture, completion: completion)
       }
       pipController = pip
       pipPluginRegistry = registry
