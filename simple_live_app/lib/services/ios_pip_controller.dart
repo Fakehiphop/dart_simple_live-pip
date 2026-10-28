@@ -198,6 +198,18 @@ class IosPipController {
       // 新引擎尚未就绪，dispose 会兜底销毁
     }
   }
+  /// 立即销毁原生会话（退出直播页时调用，不等 Dart 侧异步 dispose）：
+  /// remote object 拆掉后 SpringBoard 无窗可拉，僵尸小窗的根。
+  Future<void> destroySession() async {
+    if (!_ownsPage) return;
+    try {
+      await _channel.invokeMethod<void>('dispose');
+    } on PlatformException catch (error) {
+      Log.w('iOS PiP: 会话销毁失败: $error');
+    } on MissingPluginException {
+      // 引擎未就绪，无需处理
+    }
+  }
 
   /// 同步锁屏/控制中心卡片标题（主播名 + 直播间标题）。
   Future<void> updateNowPlayingInfo({String? title, String? artist}) async {
