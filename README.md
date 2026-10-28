@@ -11,13 +11,11 @@
 
 ## 下载
 
-| 版本 | 文件 | 说明 |
-|---|---|---|
-| v1.13.3 | `SimpleLive-pip_v1.13.3.ipa` | 无签名 IPA，34,477,626 B |
+| 版本 | 文件 | 大小 | SHA256 |
+|---|---|---|---|
+| v1.13.3 | [`SimpleLive-pip_v1.13.3.ipa`](https://github.com/Fakehiphop/dart_simple_live-pip-v2/releases/download/v1.13.3/SimpleLive-pip_v1.13.3.ipa) | 34,477,626 B | `52FB1DAF6AFE5ADBC2A7EC497A9687C8C0B0103CEF3DBCA91F3DFE63823ED1C9` |
 
-见 [Releases](https://github.com/Fakehiphop/dart_simple_live-pip-v2/releases)。
-
-无签名包需要自行处理签名后安装（AltStore / Sideloadly / TrollStore / 越狱设备直接侧载均可）。
+无签名包，需要自行签名后安装：AltStore / Sideloadly / TrollStore / 越狱设备直接侧载均可。
 
 ---
 
@@ -56,12 +54,13 @@
 
 | 分支 | 用途 |
 |---|---|
-| `master` | 当前可用版本，对应 v1.13.3，即 Release 中 IPA 的源码 |
-| `main` | 上游基线（未含画中画），仅作对照保留 |
-| `c1` / `c2` / `c3` | 各轮迭代的归档快照 |
-| `feat/*` | 开发过程中的临时分支，仅存档 |
+| `master` | 当前可用版本，对应 v1.13.3，即 Release 中 IPA 的源码；默认分支 |
+| `c1` / `c2` / `c3` | 各轮并行迭代的归档快照，只读参考 |
+| `o` | 画中画首次落地的原始提交存档 |
+| `z1+w` | 支线血缘归档 |
+| `feat/ios-pip-c2-zombie` | 僵尸小窗专项修复的临时分支，仅存档 |
 
-`master` 的提交历史已整理：每条提交的标题带 `-c4` 后缀，作者统一为仓库所有者，文件内容与迭代终点逐字节一致。
+`master` 的提交历史已整理：每条提交的标题带 `-c4` 后缀，作者统一为仓库所有者，文件内容与迭代终点逐字节一致（本条 README 提交除外）。
 
 ---
 
@@ -73,7 +72,7 @@ GitHub Actions 手动触发，产物为无签名 IPA：
 
 - `ref` 默认 `master`，一般不需要改
 - 产物：`ios_no_sign.ipa`（Actions artifact 名 `ios`）
-- 环境：`macos-latest`、Flutter `3.41.9`
+- 环境：`macos-latest`、Flutter `3.47.7`（3.44+ 默认启用 SPM，media-kit 的 iOS SPM 包只在 SPM 路线可用）
 
 本地构建：
 
