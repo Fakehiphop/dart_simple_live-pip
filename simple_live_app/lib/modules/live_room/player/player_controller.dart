@@ -1642,6 +1642,7 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
   /// 是否已预武装"退后台系统自动启动"。
   bool get iosPipAutoStartArmed => _iosPipAutoStartArmed;
   bool _iosPipAutoStartArmed = false;
+  bool _iosPipExitDisarmed = false;
 
   /// iOS 画中画早武装：开播即建立会话并打开系统自动启动开关
   /// （canStartPictureInPictureAutomaticallyFromInline）。自动启动的判定
@@ -1650,6 +1651,11 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
   /// 幂等：会话已就绪时重复调用是空操作。
   Future<void> armIosPipForBackground() async {
     if (!Platform.isIOS || _playerClosing) {
+      return;
+    }
+    // 退出意图已销毁会话：paused 生命周期不再重建（PlayerMixin 每房间
+    // 一个实例，新房间自动清零）。
+    if (_iosPipExitDisarmed) {
       return;
     }
     if (iosPipActiveOrEntering || _iosPipAutoStartArmed) {
@@ -1732,6 +1738,10 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     }
     try {
       await pip.disarm();
+      // canStart=false 实测挡不住 SpringBoard 自动起窗（083836：will start
+      // (auto) 发生在 setAutoStartEnabled(false) 之后 1s）——直接拆掉原生
+      // remote object，系统无窗可拉；新房间 attach 会重建会话。
+      await pip.destroySession();
     } catch (e) {
       Log.d('iOS PiP: 解除武装失败: $e');
     }
