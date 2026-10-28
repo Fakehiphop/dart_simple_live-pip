@@ -48,6 +48,9 @@ final class IosPictureInPictureController: NSObject,
     private var textureId: Int64?
     private var lastSourceRect: CGRect?
     private var playing = false
+    private var lastRate = 1.0
+    private var lastArtworkBuffer: Data?
+    private var lastArtworkRequested = false
     private var duration: Double = 0
     private var timebase: CMTimebase?
     private var pixelBufferPool: CVPixelBufferPool?
@@ -208,9 +211,12 @@ final class IosPictureInPictureController: NSObject,
         }
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] =
             NSNumber(value: timebase.map { CMTimeGetSeconds(CMTimebaseGetTime($0)) } ?? 0)
-        // 不推送 artwork（11306 实测：768×768 封面 + 每秒级整包 Replace 后
-        // mediaserverd 的 audio client 资格翻为 NOT，PiP 期 GPU 被拒 = 卡顿；
-        // 11305 无 artwork 同报 PID Mismatch 却全程 YES）。先保资格与标题。
+        // 封面回归（11310）：11306 实测的资格翻 NOT 是"每 3s 周期整包 Replace
+        // + 768×768"的频率毒；现在只在状态翻转时增量刷新、每房间只生成一次
+        // 320×320，负载低两个量级。真机若资格再翻 NOT，随时裁回。
+        if let data = lastArtworkBuffer, let img = UIImage(data: data) {
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
+        }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
@@ -598,6 +604,8 @@ final class IosPictureInPictureController: NSObject,
         renderSize = .zero
         restoring = false
         startRequested = false
+        lastArtworkBuffer = nil
+        lastArtworkRequested = false
         suspendOnStart = false
         activeFeed = false
         enteredBackground = false
@@ -641,6 +649,26 @@ final class IosPictureInPictureController: NSObject,
         if willStartAt > 0 {
             NSLog("SimpleLive PiP: first frame after willStart in %.0fms", (now - willStartAt) * 1000)
             willStartAt = 0
+        }
+        // 锁屏/控制中心封面：每房间首帧生成一次。CI 走 software renderer（后台
+        // CIContext 默认 Metal 会被 kIOGPUCommandBufferCallbackErrorBackground
+        // ExecutionNotPermitted 拒掉），生成成功即增量刷新一次卡片。
+        if !lastArtworkRequested {
+            lastArtworkRequested = true
+            let src = source
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { return }
+                let ci = CIImage(cvPixelBuffer: src)
+                let w = CGFloat(CVPixelBufferGetWidth(src))
+                let h = CGFloat(CVPixelBufferGetHeight(src))
+                let scale = 320.0 / max(w, h)
+                let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                let ctx = CIContext(options: [.useSoftwareRenderer: true])
+                guard let cg = ctx.createCGImage(scaled, from: scaled.extent),
+                      let jpeg = UIImage(cgImage: cg).jpegData(compressionQuality: 0.8) else { return }
+                self.lastArtworkBuffer = jpeg
+                DispatchQueue.main.async { self.refreshNowPlayingInfo() }
+            }
         }
 
         // 输出尺寸：长边上限 960；已知 PiP 实际 renderSize 时再压到它以内
