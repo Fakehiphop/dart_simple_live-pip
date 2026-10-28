@@ -1716,6 +1716,27 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     return;
   }
 
+  /// 用户已表达离开直播页的意图（返回键/手势 pop/onClose）：在 dispose
+  /// 异步落地前先解除武装。否则上滑切桌面的瞬间系统仍看到 canStart=true，
+  /// 把僵尸小窗拉起来、销毁落地后再拆掉（11314 竞速分析）。
+  /// 与 disarmIosPipForBackground 的区别：那个是回前台占位（会话常驻、
+  /// 不解除武装），这个是退出前的最后防御。
+  Future<void> disarmIosPipForExit() async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    _iosPipAutoStartArmed = false;
+    final pip = _iosPip;
+    if (pip == null) {
+      return;
+    }
+    try {
+      await pip.disarm();
+    } catch (e) {
+      Log.d('iOS PiP: 解除武装失败: $e');
+    }
+  }
+
   /// 创建 iOS 画中画会话（与播放器同生命周期，离开页面时释放）。
   void _ensureIosPipSession() {
     if (!Platform.isIOS || _iosPip != null) {
