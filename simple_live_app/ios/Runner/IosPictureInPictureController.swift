@@ -70,6 +70,12 @@ final class IosPictureInPictureController: NSObject,
     private var sourceFrames = 0
     private var droppedFrames = 0
     private var lastStatsAt = 0.0
+    // 锁屏卡片标题：主播名 + 直播间标题，Dart 推送。
+    private var nowPlayingTitle = "SimpleLive"
+    private var nowPlayingArtist = ""
+    // 喂帧兜底泵：小窗期间即使 mpv 推送变稀也按 30Hz 主动拉帧。
+    private var feedPump: DispatchSourceTimer?
+    private let feedPumpQueue = DispatchQueue(label: "SimpleLive.PiP.feedPump")
 
     init(messenger: FlutterBinaryMessenger) {
         channel = FlutterMethodChannel(name: "simple_live/ios_pip", binaryMessenger: messenger)
@@ -106,6 +112,105 @@ final class IosPictureInPictureController: NSObject,
                 result(FlutterMethodNotImplemented)
             }
         }
+    }
+
+    /// Now Playing 资格注册：mediaserverd 只把后台 GPU 提交权授予它认定为
+    /// "Now Playing eligible" 的应用——仅有音频会话（.playback + setActive）
+    /// 不够，还要求 MPNowPlayingInfoCenter 已注册且 MPRemoteCommandCenter
+    /// 至少有一条启用的命令处理器，资格在音频 I/O 启动时评估。控制器随
+    /// Flutter 引擎引导创建（早于任何直播流的 I/O），在此处注册即可。
+    /// 缺资格的实测表现：PiP 层在后台持续收到
+    /// kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted，
+    /// 小窗停在最后两帧之间来回抖动（表现为 2 帧动图）。
+    private func registerNowPlaying() {
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = [
+            MPMediaItemPropertyTitle: "SimpleLive",
+            MPNowPlayingInfoPropertyIsLiveStream: NSNumber(value: true),
+            MPNowPlayingInfoPropertyPlaybackRate: NSNumber(value: 0.0),
+        ]
+        let commands = MPRemoteCommandCenter.shared()
+        commands.playCommand.isEnabled = true
+        commands.playCommand.addTarget { [weak self] _ in
+            self?.forwardRemoteAction(play: true)
+            return .success
+        }
+        commands.pauseCommand.isEnabled = true
+        commands.pauseCommand.addTarget { [weak self] _ in
+            self?.forwardRemoteAction(play: false)
+            return .success
+        }
+        commands.togglePlayPauseCommand.isEnabled = true
+        commands.togglePlayPauseCommand.addTarget { [weak self] _ in
+            guard let self = self else { return .commandFailed }
+            self.forwardRemoteAction(play: !self.playing)
+            return .success
+        }
+        NSLog("SimpleLive PiP: now playing registered at launch")
+    }
+
+    /// 锁屏/控制中心的播放命令 → 复用 Dart 侧既有的 onAction 通路
+    /// （与小窗叠加层按钮同一条协议）。
+    private func forwardRemoteAction(play: Bool) {
+        channel.invokeMethod("onAction", arguments: ["action": play ? "play" : "pause"])
+    }
+
+    /// 锁屏卡片标题（主播名 + 直播间标题），Dart 在武装/房间信息就绪时推送。
+    private func updateNowPlayingInfo(_ args: [String: Any]) {
+        if let title = args["title"] as? String, !title.isEmpty {
+            nowPlayingTitle = title
+        }
+        if let artist = args["artist"] as? String {
+            nowPlayingArtist = artist
+        }
+        refreshNowPlayingInfo()
+    }
+
+    /// 喂帧兜底泵：对照实验里 mpv→textureFrameAvailable 推送链在后台实测
+    /// 只有 ~4fps（PiliPlus 无泵且注释称"帧距由 mpv 决定"，其小窗流畅，
+    /// 说明推送速率受环境影响）。泵按 30Hz 主动拉最新纹理帧，force 绕过
+    /// 采样节流；内容未更新时拷到的是重复帧，无副作用。
+    private func startFeedPump() {
+        guard feedPump == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: feedPumpQueue)
+        timer.schedule(deadline: .now(), repeating: 1.0 / 30.0)
+        timer.setEventHandler { [weak self] in
+            guard let self = self, self.activeFeed, let id = self.textureId else { return }
+            let scheduledAt = CACurrentMediaTime()
+            DispatchQueue.main.async {
+                let hopDelay = CACurrentMediaTime() - scheduledAt
+                self.mainHopDelaySum += hopDelay
+                self.mainHopCount += 1
+                guard self.activeFeed, let buffer = self.copyPixelBuffer?(id) else { return }
+                self.onVideoFrame(buffer, textureId: id, force: true)
+            }
+        }
+        timer.resume()
+        feedPump = timer
+        NSLog("SimpleLive PiP: feed pump started (30Hz)")
+    }
+
+    private func stopFeedPump() {
+        guard feedPump != nil else { return }
+        feedPump?.cancel()
+        feedPump = nil
+        NSLog("SimpleLive PiP: feed pump stopped")
+    }
+
+    /// Now Playing 速率/进度跟随：控制中心卡片据此显示"在播"状态；
+    /// mediaserverd 的资格评估同样参考（rate=0 视为未播放）。
+    private func refreshNowPlayingInfo() {
+        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [String: Any]()
+        info[MPNowPlayingInfoPropertyPlaybackRate] = NSNumber(value: playing ? lastRate : 0.0)
+        info[MPMediaItemPropertyTitle] = nowPlayingTitle
+        if !nowPlayingArtist.isEmpty {
+            info[MPMediaItemPropertyArtist] = nowPlayingArtist
+        }
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] =
+            NSNumber(value: timebase.map { CMTimeGetSeconds(CMTimebaseGetTime($0)) } ?? 0)
+        // 不推送 artwork（11306 实测：768×768 封面 + 每秒级整包 Replace 后
+        // mediaserverd 的 audio client 资格翻为 NOT，PiP 期 GPU 被拒 = 卡顿；
+        // 11305 无 artwork 同报 PID Mismatch 却全程 YES）。先保资格与标题。
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
     /// 建立画中画会话（内容源 + delegate + 时基）。开播即调用（早武装），
