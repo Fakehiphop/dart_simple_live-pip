@@ -54,54 +54,15 @@
 
 | 分支 | 用途 |
 |---|---|
-| `master` | 当前可用版本，对应 v1.13.3，即 Release 中 IPA 的源码；默认分支 |
-| `c1` / `c2` / `c3` | 各轮并行迭代的归档快照，只读参考 |
-| `o` | 画中画首次落地的原始提交存档 |
-| `z1+w` | 支线血缘归档 |
-| `feat/ios-pip-c2-zombie` | 僵尸小窗专项修复的临时分支，仅存档 |
-
-`master` 的提交历史已整理：本会话（代号 c4）产生的提交标题统一带 `-c4` 后缀、作者统一为仓库所有者，文件内容与迭代终点逐字节一致；早于本会话的 `v2`–`v12` 基线提交保持原样。
-
----
-
-## 构建
-
-GitHub Actions 手动触发，产物为无签名 IPA：
-
-`.github/workflows/publish_app_release_ios_manual.yml`
-
-- `ref` 默认 `master`，一般不需要改
-- 产物：`ios_no_sign.ipa`（Actions artifact 名 `ios`）
-- 环境：`macos-latest`、Flutter `3.47.7`（3.44+ 默认启用 SPM，media-kit 的 iOS SPM 包只在 SPM 路线可用）
-
-本地构建：
-
-```bash
-cd simple_live_app
-flutter build ios --release --no-codesign
-mkdir -p build/ios/iphoneos/Payload
-cp -R build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/Runner.app
-cd build/ios/iphoneos && zip -q -r ios_no_sign.ipa Payload
-```
-
----
-
-## 排查
-
-画中画的运行日志统一带 `SimpleLive PiP` 前缀，真机可用 syslog 或 Console.app 过滤：
-
-```bash
-idevicesyslog | grep "SimpleLive PiP"
-```
-
-关键字段包括 `armed` / `attach` / `will start` / `did start` / `enqueue` / `renderSize` / `disarm`。
+| `master` | 当前可用版本，对应 v1.13.3（Release 中的 IPA 源码）；默认分支 |
+| 其他 | 各轮并行迭代的归档快照，只读参考 |
 
 ---
 
 ## 参考实现
 
-帧调度与像素搬运参考 [Rladmsrl/SwiftPeek](https://github.com/Rladmsrl/SwiftPeek)（斗鱼客户端，同为 GPL-3.0）的 `PiPFramePump` / `PiPPixelTransfer`；
-原生侧结构与 PiliPlus 的 `PipPlugin` 同构。其 `PiPLiveFrameSource` 未采用——它依赖 FLV demux，本项目没有。
+- [PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus) —— 原生 iOS 画中画插件（`PipPlugin`）的整体结构与本项目同构，本项目的实现参照其思路。
+- [SwiftPeek](https://github.com/Rladmsrl/SwiftPeek) —— 同类 iOS 直播画中画方案（GPL-3.0）。本项目的帧调度与像素搬运未参考该仓库。
 
 ---
 
