@@ -1597,6 +1597,7 @@ class LiveRoomController extends PlayerController
       windowManager.removeListener(this);
     }
     unawaited(cancelAutoPipOnLeave());
+    unawaited(disarmIosPipForExit());
     CurrentRoomService.instance.clearRoom();
     scrollController.removeListener(scrollListener);
     liveRoomFollowScrollController.dispose();
